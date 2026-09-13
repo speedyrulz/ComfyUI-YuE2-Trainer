@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-yue2-trainer"
+description = "Train YuE2 LoRAs (acoustic MODEL LoRA and planner CLIP LoRA) inside ComfyUI"
+version = "0.1.0"
+license = { text = "Apache-2.0" }
+dependencies = ["soundfile>=0.12", "torchaudio"]
+
+[project.urls]
+Repository = "https://github.com/multimodal-art-projection/YuE"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-YuE2-Trainer"
+Icon = ""

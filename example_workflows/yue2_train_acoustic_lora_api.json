@@ -1,0 +1,118 @@
+{
+ "1": {
+  "class_type": "CheckpointLoaderSimple",
+  "inputs": {
+   "ckpt_name": "yue2_3b_bf16.safetensors"
+  }
+ },
+ "2": {
+  "class_type": "YuE2TrainerDatasetFolder",
+  "inputs": {
+   "folder": "yue2_dataset",
+   "default_style": "genre, instruments, vocal character, language, tempo",
+   "default_lyrics": "",
+   "recursive": true
+  }
+ },
+ "3": {
+  "class_type": "YuE2TrainerEncodeDataset",
+  "inputs": {
+   "dataset": [
+    "2",
+    0
+   ],
+   "vae": [
+    "1",
+    2
+   ],
+   "transcribe": "none",
+   "max_seconds": 0.0,
+   "window_seconds": 60,
+   "cache_dir": "yue2_trainer_cache",
+   "force_reencode": false
+  }
+ },
+ "4": {
+  "class_type": "YuE2TrainerAcousticLoRA",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "clip": [
+    "1",
+    1
+   ],
+   "dataset": [
+    "3",
+    0
+   ],
+   "segment_seconds": 30.0,
+   "prefix_mode": "auto",
+   "use_semantic_tokens": true,
+   "train_acoustic_head": false,
+   "timestep_sampling": "uniform",
+   "shift": 1.0,
+   "steps": 300,
+   "learning_rate": 0.0001,
+   "rank": 16,
+   "alpha": 16.0,
+   "targets": "attention+mlp",
+   "batch_size": 1,
+   "grad_accumulation": 1,
+   "warmup_steps": 10,
+   "seed": 0,
+   "optimizer": "AdamW",
+   "lora_dtype": "fp32",
+   "gradient_checkpointing": true,
+   "max_grad_norm": 1.0,
+   "existing_lora": "[None]",
+   "save_every": 50,
+   "save_name": "yue2_acoustic",
+   "devices": "auto"
+  }
+ },
+ "5": {
+  "class_type": "YuE2TrainerSaveLoRA",
+  "inputs": {
+   "lora": [
+    "4",
+    0
+   ],
+   "name": "yue2_acoustic",
+   "add_timestamp": true,
+   "loss_map": [
+    "4",
+    1
+   ]
+  }
+ },
+ "6": {
+  "class_type": "LossGraphNode",
+  "inputs": {
+   "loss": [
+    "4",
+    1
+   ],
+   "filename_prefix": "yue2_acoustic_loss"
+  }
+ },
+ "7": {
+  "class_type": "PreviewAny",
+  "inputs": {
+   "source": [
+    "4",
+    3
+   ]
+  }
+ },
+ "8": {
+  "class_type": "PreviewAny",
+  "inputs": {
+   "source": [
+    "3",
+    1
+   ]
+  }
+ }
+}

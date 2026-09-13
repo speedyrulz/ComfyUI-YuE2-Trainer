@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+cache/
+*.safetensors
+*.loss.json
+.pytest_cache/

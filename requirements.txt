@@ -1,0 +1,3 @@
+# Everything else (torch, safetensors, tokenizers, av, comfy-kitchen) comes with ComfyUI itself.
+soundfile>=0.12
+torchaudio
