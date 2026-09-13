@@ -356,6 +356,12 @@ def _common_training_inputs(default_lr, default_steps):
                                 "saves and for the TensorBoard run."),
         io.Int.Input("log_every", default=1, min=1, max=10000,
                      tooltip="Print step / loss / lr / grad-norm / ETA to the console every N steps."),
+        io.Int.Input("eval_every", default=50, min=0, max=100000,
+                     tooltip="Every N steps, score a fixed evaluation set (same crops, same sigmas, same noise every "
+                             "time) so the curve is not buried in per-step sampling noise; also scored before step 1. "
+                             "0 = off."),
+        io.Int.Input("eval_samples", default=8, min=1, max=256, advanced=True,
+                     tooltip="Size of the fixed evaluation set (forward passes per evaluation)."),
         io.Boolean.Input("tensorboard", default=False,
                          tooltip="Log loss, learning rate and grad norm to TensorBoard (pip install tensorboard)."),
         io.String.Input("tensorboard_dir", default="yue2_tensorboard", advanced=True,
@@ -409,7 +415,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
     def execute(cls, model, clip, dataset, segment_seconds, conditioning, prefix_mode, use_semantic_tokens, train_acoustic_head,
                 caption_dropout, timestep_sampling, shift, steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
-                existing_lora, save_every, save_name, log_every, tensorboard, tensorboard_dir):
+                existing_lora, save_every, save_name, log_every, eval_every, eval_samples, tensorboard, tensorboard_dir):
         cfg = AcousticConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             lr_schedule=lr_schedule,
@@ -420,7 +426,8 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             timestep_sampling=timestep_sampling, shift=shift, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
-            log_every=log_every, tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
+            log_every=log_every, eval_every=eval_every, eval_samples=eval_samples,
+            tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
         cfg.save_callback = lambda sd, n, info: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name})
         pbar = comfy.utils.ProgressBar(steps)
@@ -432,7 +439,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress, interrupt_check=_interrupt)
         result.info["save_name"] = save_name
         report = _report(result)
-        return io.NodeOutput(result.lora_sd, {"loss": result.losses, "info": result.info}, result.steps, report)
+        return io.NodeOutput(result.lora_sd, {"loss": result.losses, "eval": result.evals, "info": result.info}, result.steps, report)
 
 
 class YuE2TrainerPlannerLoRA(io.ComfyNode):
@@ -455,8 +462,10 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
                                tooltip="Planning instruction the LoRA is trained under; use the mode you generate with. "
                                        "auto: chords in the score -> full, else melody."),
                 io.Int.Input("max_tokens", default=4096, min=64, max=20000,
-                             tooltip="Random crop of the trained span (ABC or codec tokens) per step."),
-                *_common_training_inputs(1e-4, 300),
+                             tooltip="Longest trained span (ABC or codec tokens) per step. Longer scores are trained "
+                                     "through head, tail and middle windows (the ending is always learned); 8192 "
+                                     "fits most whole songs on a 16 GB card."),
+                *_common_training_inputs(5e-5, 100),
             ],
             outputs=[LORA_MODEL.Output("lora", display_name="lora"), LOSS_MAP.Output("loss_map", display_name="loss_map"),
                      io.Int.Output("steps", display_name="steps"), io.String.Output("report", display_name="report")],
@@ -466,7 +475,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
     def execute(cls, clip, dataset, train_abc, train_semantic, abc_mode, max_tokens, steps, learning_rate, lr_schedule,
                 rank, alpha,
                 targets, batch_size, grad_accumulation, warmup_steps, seed, optimizer, lora_dtype,
-                gradient_checkpointing, max_grad_norm, devices, existing_lora, save_every, save_name, log_every,
+                gradient_checkpointing, max_grad_norm, devices, existing_lora, save_every, save_name, log_every, eval_every, eval_samples,
                 tensorboard, tensorboard_dir):
         cfg = PlannerConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
@@ -475,7 +484,8 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
             abc_mode=abc_mode, max_tokens=max_tokens, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
-            log_every=log_every, tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
+            log_every=log_every, eval_every=eval_every, eval_samples=eval_samples,
+            tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
         cfg.save_callback = lambda sd, n, info: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name})
         pbar = comfy.utils.ProgressBar(steps)
@@ -487,7 +497,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
             result = train_planner_lora(clip, dataset, cfg, progress=progress, interrupt_check=_interrupt)
         result.info["save_name"] = save_name
         report = _report(result)
-        return io.NodeOutput(result.lora_sd, {"loss": result.losses, "info": result.info}, result.steps, report)
+        return io.NodeOutput(result.lora_sd, {"loss": result.losses, "eval": result.evals, "info": result.info}, result.steps, report)
 
 
 def _report(result) -> str:
@@ -496,6 +506,11 @@ def _report(result) -> str:
     tail = sum(losses[-10:]) / max(1, len(losses[-10:]))
     lines = [f"{result.info.get('kind')} LoRA: {result.steps} steps in {result.seconds / 60:.1f} min",
              f"loss first10={head:.4f} last10={tail:.4f} min={min(losses):.4f}" if losses else "no steps"]
+    evals = getattr(result, "evals", None) or []
+    if len(evals) > 1:
+        best = min(evals, key=lambda e: e[1])
+        lines.append(f"fixed-set eval loss: {evals[0][1]:.4f} before training -> {evals[-1][1]:.4f} at the end "
+                     f"(best {best[1]:.4f} at step {best[0]})")
     if result.info.get("tensorboard"):
         lines.append(f"tensorboard run: {result.info['tensorboard']}")
     lines.append(json.dumps(result.info, ensure_ascii=False))

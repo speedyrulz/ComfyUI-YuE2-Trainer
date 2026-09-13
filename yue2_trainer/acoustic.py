@@ -11,7 +11,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn as nn
 
-from .constants import FRAMES_PER_SECOND, MODEL_KEY_PREFIX, CONTEXT
+from .constants import FRAMES_PER_SECOND, LATENT_CHANNELS, MODEL_KEY_PREFIX, CONTEXT
 from .dataset import Dataset, Item
 from .forward import nar_forward
 from .lora import create_lora, select_target_modules, count_parameters
@@ -52,6 +52,8 @@ class AcousticConfig:
     optimizer: str = "AdamW"
     devices: str = "auto"               # auto | cuda:N | all | cuda:0,cuda:1
     log_every: int = 1                  # console line every N steps
+    eval_every: int = 50                # fixed-noise validation loss every N steps (0 = off)
+    eval_samples: int = 8               # size of the fixed evaluation set
     tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
     run_name: str = ""                  # TensorBoard run name (timestamp appended)
     existing_lora: Optional[dict] = None
@@ -66,6 +68,14 @@ class TrainResult:
     steps: int = 0
     seconds: float = 0.0
     info: dict = field(default_factory=dict)
+    evals: list = field(default_factory=list)   # [[step, fixed-noise loss], ...]
+
+
+def _shift_sigma(cfg: AcousticConfig, u: float) -> float:
+    u = min(max(u, 1e-4), 1.0 - 1e-4)
+    if cfg.shift != 1.0:
+        u = cfg.shift * u / (1.0 + (cfg.shift - 1.0) * u)
+    return float(u)
 
 
 def _sample_sigma(cfg: AcousticConfig, rng: torch.Generator) -> float:
@@ -73,10 +83,75 @@ def _sample_sigma(cfg: AcousticConfig, rng: torch.Generator) -> float:
         u = torch.sigmoid(torch.randn((), generator=rng) * cfg.logit_std + cfg.logit_mean).item()
     else:
         u = torch.rand((), generator=rng).item()
-    u = min(max(u, 1e-4), 1.0 - 1e-4)
-    if cfg.shift != 1.0:
-        u = cfg.shift * u / (1.0 + (cfg.shift - 1.0) * u)
-    return float(u)
+    return _shift_sigma(cfg, u)
+
+
+def _sigma_quantile(cfg: AcousticConfig, q: float) -> float:
+    """Sigma at quantile ``q`` of the training sigma distribution (used to stratify the evaluation set)."""
+    q = min(max(q, 1e-4), 1.0 - 1e-4)
+    if cfg.timestep_sampling == "logit_normal":
+        u = torch.sigmoid(torch.special.ndtri(torch.tensor(q, dtype=torch.float64)) * cfg.logit_std + cfg.logit_mean).item()
+    else:
+        u = q
+    return _shift_sigma(cfg, u)
+
+
+@dataclass
+class _EvalEntry:
+    index: int            # training sample (chunk) index
+    offset: int           # frame offset inside the chunk
+    length: int           # frames
+    sigma: float
+    noise: torch.Tensor   # [1, 64, length] on CPU
+
+
+def build_eval_set(chunks: list[tuple[int, int]], cfg: AcousticConfig, seg_frames: int, seed: int) -> list[_EvalEntry]:
+    """Fixed crops, sigmas and noise for the validation loss.
+
+    The same entries are evaluated every time, so the resulting curve moves only when the model does;
+    sigmas are stratified over the training distribution instead of sampled, which removes most of the
+    variance a random draw would add.
+    """
+    n = int(cfg.eval_samples) if cfg.eval_every > 0 else 0
+    if n <= 0 or not chunks:
+        return []
+    rng = random.Random(seed + 12345)
+    gen = torch.Generator().manual_seed(seed + 12345)
+    order = list(range(len(chunks)))
+    rng.shuffle(order)
+    entries = []
+    for i in range(n):
+        index = order[i % len(order)]
+        c0, c1 = chunks[index]
+        frames = c1 - c0
+        length = seg_frames if seg_frames and frames > seg_frames else frames
+        offset = rng.randint(0, frames - length) if frames > length else 0
+        sigma = _sigma_quantile(cfg, (i + 0.5) / n)
+        noise = torch.randn((1, LATENT_CHANNELS, length), generator=gen)
+        entries.append(_EvalEntry(index, offset, length, sigma, noise))
+    return entries
+
+
+def _evaluate(replica: "Replica", samples: list, eval_set: list[_EvalEntry], cfg: AcousticConfig) -> float:
+    """Mean flow-matching loss over the fixed evaluation set with the current LoRA (no gradients)."""
+    device, dm = replica.device, replica.root.diffusion_model
+    total = 0.0
+    with torch.no_grad():
+        for entry in eval_set:
+            sample = samples[entry.index]
+            c0, _ = sample.chunk
+            x0 = sample.item.latents[:, c0 + entry.offset: c0 + entry.offset + entry.length]
+            x0 = x0.to(device=device, dtype=torch.float32)[None]
+            noise = entry.noise.to(device)
+            sigma = torch.tensor([entry.sigma], device=device)
+            x_t = (1.0 - sigma.view(-1, 1, 1)) * x0 + sigma.view(-1, 1, 1) * noise
+            prefix_kv = sample.prefix.kv.to(device).clone()
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                pred = nar_forward(dm, x_t.to(torch.bfloat16), sigma, prefix_kv, sample.prefix.ar_length,
+                                   frame_offset=0 if sample.compact else entry.offset, checkpointing=False)
+            total += torch.nn.functional.mse_loss(pred.float(), noise - x0).item()
+            del pred, prefix_kv, x_t, x0, noise
+    return total / len(eval_set)
 
 
 def _make_optimizer(name: str, params, lr: float, weight_decay: float):
@@ -269,7 +344,10 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     counts = split_counts(micro_steps, len(replicas))
     seg_frames = int(round(cfg.segment_seconds * FRAMES_PER_SECOND)) if cfg.segment_seconds > 0 else 0
     losses = []
+    eval_set = build_eval_set([s.chunk for s in samples], cfg, seg_frames, cfg.seed)
+    evals: list[list] = []
     info = {"kind": "acoustic", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets,
+            "eval_every": cfg.eval_every if eval_set else 0, "eval_samples": len(eval_set), "eval": evals,
             "train_acoustic_head": cfg.train_acoustic_head, "steps": cfg.steps, "items": len(dataset.with_latents()),
             "chunks": len(samples), "segment_seconds": cfg.segment_seconds, "timestep_sampling": cfg.timestep_sampling,
             "shift": cfg.shift, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule, "mode": cfg.mode,
@@ -313,7 +391,14 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             del pred, loss, prefix_kv, x_t, x0, noise
         return total
 
+    def run_eval(index: int):
+        value = _evaluate(primary, samples, eval_set, cfg)
+        evals.append([index, value])
+        monitor.eval(index, value)
+
     try:
+        if eval_set:
+            run_eval(0)
         for step in range(cfg.steps):
             if interrupt_check is not None:
                 interrupt_check()
@@ -328,6 +413,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             step_loss = loss_sum / micro_steps
             losses.append(step_loss)
             monitor.step(step + 1, step_loss, optimizer.param_groups[0]["lr"], grad_norm)
+            if eval_set and ((step + 1) % cfg.eval_every == 0 or step + 1 == cfg.steps):
+                run_eval(step + 1)
             if progress is not None:
                 progress(step + 1, cfg.steps, step_loss)
             if cfg.save_every and cfg.save_callback and (step + 1) % cfg.save_every == 0 and step + 1 < cfg.steps:
@@ -350,8 +437,10 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     for adapter in primary.lora.adapters:
         adapter.requires_grad_(False)
     info["tensorboard"] = str(monitor.log_dir) if monitor.log_dir else None
+    if evals:
+        info["eval_loss_start"], info["eval_loss_final"] = evals[0][1], evals[-1][1]
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,
-                       seconds=time.perf_counter() - start_time, info=info)
+                       seconds=time.perf_counter() - start_time, info=info, evals=evals)
 
 
-__all__ = ["AcousticConfig", "TrainResult", "train_acoustic_lora", "prepare_samples"]
+__all__ = ["AcousticConfig", "TrainResult", "train_acoustic_lora", "prepare_samples", "build_eval_set"]

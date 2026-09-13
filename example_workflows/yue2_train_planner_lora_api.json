@@ -78,7 +78,9 @@
    "log_every": 1,
    "tensorboard": false,
    "tensorboard_dir": "yue2_tensorboard",
-   "lr_schedule": "cosine"
+   "lr_schedule": "cosine",
+   "eval_every": 50,
+   "eval_samples": 8
   }
  },
  "5": {

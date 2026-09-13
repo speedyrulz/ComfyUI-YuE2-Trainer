@@ -43,6 +43,8 @@ class PlannerConfig:
     optimizer: str = "AdamW"
     devices: str = "auto"              # auto | cuda:N | all | cuda:0,cuda:1
     log_every: int = 1                  # console line every N steps
+    eval_every: int = 50                # fixed-crop validation loss every N steps (0 = off)
+    eval_samples: int = 8               # size of the fixed evaluation set
     tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
     run_name: str = ""                  # TensorBoard run name (timestamp appended)
     existing_lora: Optional[dict] = None
@@ -76,15 +78,59 @@ def build_sequences(clip, dataset: Dataset, cfg: PlannerConfig) -> list[_Sequenc
     return sequences
 
 
+CROP_CONTEXT = 256   # unsupervised context tokens at the start of a window that does not begin at the score's start
+
+
 def _crop(seq: _Sequence, max_tokens: int, rng: random.Random) -> tuple[list, int]:
-    """Keep the prefix; crop the trained span to ``max_tokens`` at a random offset."""
+    """Keep the prefix; crop the trained span to ``max_tokens`` without teaching false starts or endless scores.
+
+    A span longer than the limit is trained through one of three windows per draw: its head (so the
+    opening of a score is learned), its tail (so the closing token is learned and the model keeps ending
+    its scores), or a random middle window. Windows that do not start at the beginning keep their first
+    tokens as unsupervised context, so the model is never taught to begin a score mid-way. The old
+    uniformly random window almost never contained the closing token for long songs, and a planner LoRA
+    trained that way stops ending its scores after a few dozen steps.
+    """
     span = len(seq.ids) - seq.loss_start
     limit = min(max_tokens, CONTEXT - seq.loss_start)
     if span <= limit:
         return seq.ids, seq.loss_start
-    start = rng.randint(0, span - limit)
+    draw = rng.random()
+    if draw < 1.0 / 3.0:
+        start = 0
+    elif draw < 2.0 / 3.0:
+        start = span - limit
+    else:
+        start = rng.randint(0, span - limit)
     ids = seq.ids[:seq.loss_start] + seq.ids[seq.loss_start + start: seq.loss_start + start + limit]
-    return ids, seq.loss_start
+    context = min(CROP_CONTEXT, limit // 4) if start > 0 else 0
+    return ids, seq.loss_start + context
+
+
+def build_eval_set(sequences: list[_Sequence], cfg: PlannerConfig, seed: int) -> list[tuple[list, int]]:
+    """Fixed crops (ids, loss_start) for the validation loss; the same crops are scored at every evaluation."""
+    n = int(cfg.eval_samples) if cfg.eval_every > 0 else 0
+    if n <= 0 or not sequences:
+        return []
+    rng = random.Random(seed + 12345)
+    order = list(range(len(sequences)))
+    rng.shuffle(order)
+    return [_crop(sequences[order[i % len(order)]], cfg.max_tokens, rng) for i in range(n)]
+
+
+def _evaluate(replica: "Replica", eval_set: list[tuple[list, int]]) -> float:
+    """Mean cross-entropy over the fixed evaluation crops with the current LoRA (no gradients)."""
+    device, llm = replica.device, replica.root.model
+    total = 0.0
+    with torch.no_grad():
+        for ids, loss_start in eval_set:
+            tokens = torch.tensor([ids], dtype=torch.long, device=device)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                hidden = ar_hidden(llm, tokens, torch.bfloat16, checkpointing=False)
+                loss = chunked_cross_entropy(llm.lm_head, hidden[0, loss_start - 1: -1], tokens[0, loss_start:])
+            total += loss.item()
+            del hidden, loss, tokens
+    return total / len(eval_set)
 
 
 def _load_clips(clip, devices: list[torch.device]):
@@ -150,7 +196,10 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
                         "raise it to keep every GPU busy", micro_steps, len(devices))
     counts = split_counts(micro_steps, len(replicas))
     losses = []
+    eval_set = build_eval_set(sequences, cfg, cfg.seed)
+    evals: list[list] = []
     info = {"kind": "planner", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets, "steps": cfg.steps,
+            "eval_every": cfg.eval_every if eval_set else 0, "eval_samples": len(eval_set), "eval": evals,
             "sequences": len(sequences), "train_abc": cfg.train_abc, "train_semantic": cfg.train_semantic,
             "max_tokens": cfg.max_tokens, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
@@ -176,7 +225,14 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             del hidden, loss, tokens
         return total
 
+    def run_eval(index: int):
+        value = _evaluate(primary, eval_set)
+        evals.append([index, value])
+        monitor.eval(index, value)
+
     try:
+        if eval_set:
+            run_eval(0)
         for step in range(cfg.steps):
             if interrupt_check is not None:
                 interrupt_check()
@@ -191,6 +247,8 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             step_loss = loss_sum / micro_steps
             losses.append(step_loss)
             monitor.step(step + 1, step_loss, optimizer.param_groups[0]["lr"], grad_norm)
+            if eval_set and ((step + 1) % cfg.eval_every == 0 or step + 1 == cfg.steps):
+                run_eval(step + 1)
             if progress is not None:
                 progress(step + 1, cfg.steps, step_loss)
             if cfg.save_every and cfg.save_callback and (step + 1) % cfg.save_every == 0 and step + 1 < cfg.steps:
@@ -213,8 +271,10 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
     for adapter in primary.lora.adapters:
         adapter.requires_grad_(False)
     info["tensorboard"] = str(monitor.log_dir) if monitor.log_dir else None
+    if evals:
+        info["eval_loss_start"], info["eval_loss_final"] = evals[0][1], evals[-1][1]
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,
-                       seconds=time.perf_counter() - start_time, info=info)
+                       seconds=time.perf_counter() - start_time, info=info, evals=evals)
 
 
-__all__ = ["PlannerConfig", "train_planner_lora", "build_sequences"]
+__all__ = ["PlannerConfig", "train_planner_lora", "build_sequences", "build_eval_set", "CROP_CONTEXT"]

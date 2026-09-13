@@ -76,7 +76,9 @@
    "tensorboard_dir": "yue2_tensorboard",
    "lr_schedule": "cosine",
    "caption_dropout": 0.1,
-   "conditioning": "compact"
+   "conditioning": "compact",
+   "eval_every": 50,
+   "eval_samples": 8
   }
  },
  "5": {

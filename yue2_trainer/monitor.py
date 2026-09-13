@@ -35,6 +35,7 @@ class TrainMonitor:
         self.window = window
         self.start = time.perf_counter()
         self.losses: list[float] = []
+        self.evals: list[tuple[int, float]] = []
         self.writer = None
         self.log_dir = None
         if tensorboard_dir:
@@ -73,6 +74,16 @@ class TrainMonitor:
                      self.kind, index, self.total, loss, self.window, avg, lr, grad,
                      _fmt_seconds(elapsed), _fmt_seconds(eta))
 
+    def eval(self, index: int, loss: float):
+        """Fixed-set validation loss at step ``index`` (0 = before training)."""
+        self.evals.append((index, loss))
+        if self.writer is not None:
+            self.writer.add_scalar("loss/eval_fixed", loss, index)
+        start = self.evals[0][1]
+        best = min(v for _, v in self.evals)
+        LOG.info("YuE2 %s eval step %d/%d  fixed-set loss %.4f  (start %.4f, best %.4f, change %+.1f%%)",
+                 self.kind, index, self.total, loss, start, best, (loss / start - 1.0) * 100.0 if start else 0.0)
+
     def close(self, info: Optional[dict] = None):
         if self.writer is not None:
             if info:
@@ -84,6 +95,10 @@ class TrainMonitor:
             LOG.info("YuE2 %s finished: %d steps in %s, first loss %.4f, last %.4f, min %.4f", self.kind,
                      len(self.losses), _fmt_seconds(time.perf_counter() - self.start),
                      self.losses[0], self.losses[-1], min(self.losses))
+        if len(self.evals) > 1:
+            LOG.info("YuE2 %s fixed-set loss: %.4f before training -> %.4f at the end (best %.4f at step %d)", self.kind,
+                     self.evals[0][1], self.evals[-1][1], min(v for _, v in self.evals),
+                     min(self.evals, key=lambda e: e[1])[0])
 
 
 __all__ = ["TrainMonitor"]

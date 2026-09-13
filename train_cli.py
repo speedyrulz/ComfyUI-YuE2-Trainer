@@ -130,7 +130,7 @@ def save_result(result, args, kind: str):
     out.parent.mkdir(parents=True, exist_ok=True)
     info = {**result.info, "final_loss": result.losses[-1] if result.losses else None}
     save_lora_file(result.lora_sd, out, info)
-    (out.with_suffix(".loss.json")).write_text(json.dumps({"loss": result.losses, "info": info}, indent=1))
+    (out.with_suffix(".loss.json")).write_text(json.dumps({"loss": result.losses, "eval": result.evals, "info": info}, indent=1))
     logging.info("saved %s LoRA (%d tensors) to %s", kind, len(result.lora_sd), out)
     return out
 
@@ -166,6 +166,9 @@ def add_common(p):
     p.add_argument("--devices", default="auto",
                    help="auto | cuda:N | all (data parallel on every GPU) | cuda:0,cuda:1")
     p.add_argument("--log-every", type=int, default=1, help="Console step/loss line every N steps.")
+    p.add_argument("--eval-every", type=int, default=50,
+                   help="Score a fixed evaluation set (same crops/sigmas/noise) every N steps and before step 1; 0 = off.")
+    p.add_argument("--eval-samples", type=int, default=8, help="Size of the fixed evaluation set.")
     p.add_argument("--tensorboard", default=None, metavar="DIR",
                    help="Log loss/lr/grad-norm to TensorBoard under DIR (tensorboard --logdir DIR).")
     p.add_argument("--run-name", default="", help="TensorBoard run name (default: output name).")
@@ -246,7 +249,8 @@ def main(argv=None):
                                  seed=args.seed, lora_dtype=args.lora_dtype,
                                  gradient_checkpointing=not args.no_checkpointing, optimizer=args.optimizer,
                                  devices=args.devices, existing_lora=existing,
-                                 log_every=args.log_every, tensorboard_dir=args.tensorboard or "",
+                                 log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
+                                 tensorboard_dir=args.tensorboard or "",
                                  run_name=args.run_name or Path(args.out).stem, save_every=args.save_every, save_callback=save_partial)
             result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress)
         else:
@@ -257,7 +261,8 @@ def main(argv=None):
                                 max_tokens=args.max_tokens, warmup_steps=args.warmup, seed=args.seed,
                                 lora_dtype=args.lora_dtype, gradient_checkpointing=not args.no_checkpointing,
                                 optimizer=args.optimizer, devices=args.devices, existing_lora=existing,
-                                log_every=args.log_every, tensorboard_dir=args.tensorboard or "",
+                                log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
+                                tensorboard_dir=args.tensorboard or "",
                                 run_name=args.run_name or Path(args.out).stem,
                                 save_every=args.save_every, save_callback=save_partial)
             result = train_planner_lora(clip, dataset, cfg, progress=progress)

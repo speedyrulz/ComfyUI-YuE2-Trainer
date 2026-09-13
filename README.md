@@ -138,13 +138,27 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   `1e-4` here moves the weights roughly as much as `8e-4` would in a PEFT-style trainer (about 6% of the
   weight norm after 1000 steps at rank 32); do not copy a higher learning rate from other trainers.
 - `save_every` writes `models/loras/<save_name>_<steps>.safetensors` checkpoints; `existing_lora` resumes.
+- `eval_every` (50) / `eval_samples` (8): score a fixed evaluation set before step 1 and every N steps. The set
+  is drawn once from the training data (fixed crops; for the acoustic trainer also fixed sigmas, stratified
+  over the sigma distribution, and fixed noise), so the number only moves when the LoRA does. It measures
+  fit to the training songs, not generalisation; see *Watching a run*.
 
 **Planner LoRA**
 
 - `train_abc` (on): `style + lyrics -> ABC + </abc>`; the loss covers only the ABC tokens.
 - `train_semantic` (off): `style + lyrics + ABC -> semantic tokens` for items that carry them.
 - `abc_mode` (full): the planning instruction the LoRA is trained under; match the mode you generate with. `auto` picks `full` when the score has chords, else `melody`.
-- `max_tokens` (4096): random crop of the trained span so long scores fit in memory.
+- `max_tokens` (4096): longest trained span per step. A score longer than this is trained through one of
+  three windows per step: its head, its tail (ending with the closing token) or a random middle window, and
+  windows that do not start at the beginning keep their first 256 tokens as unsupervised context. So the
+  model always keeps learning how a score opens and how it ends. 8192 lets most whole songs train in one
+  piece on a 16 GB card. (Before September 2026 the crop was a uniformly random window, which for 4-9 minute
+  songs almost never contained the closing token; planner LoRAs from that version stop ending their scores
+  after a few dozen steps and should be retrained.)
+- The planner learns fast: every step supervises thousands of score tokens, so 25-100 steps at `5e-5`
+  (the node defaults are 100 steps, `5e-5`, cosine) already reshape the writing. Watch the fixed-set eval
+  line and keep `save_every` small (10-25) so you can pick the best checkpoint. A planner LoRA that makes
+  `YuE2GenerateABC` run to `max_abc_tokens` instead of finishing is over-trained: use an earlier checkpoint.
 
 Both trainers use gradient checkpointing, bf16 autocast, fp32 LoRA weights, grad clipping, and run
 one item per micro-step (`batch_size × grad_accumulation` items per optimizer step).
@@ -189,15 +203,30 @@ Every step (or every `log_every` steps) the console shows
 YuE2 acoustic step 120/300  loss 0.8412  avg20 0.8630  lr 7.65e-05 grad 0.412  elapsed 4:10  eta 6:15
 ```
 
-Turn on `tensorboard` to also log `loss/step`, `loss/avg20`, `lr` and `grad_norm` per step, plus the run
-configuration and final result as text. Runs land in `ComfyUI/output/yue2_tensorboard/<save_name>_<timestamp>`
+The per-step loss of the acoustic trainer is a noisy estimate near an irreducible floor (a perfect model
+still cannot predict the random noise it was given), so it goes flat after a few dozen steps while the LoRA
+keeps changing. The fixed-set evaluation line is the one to watch:
+
+```
+YuE2 acoustic eval step 200/1000  fixed-set loss 0.9127  (start 1.0418, best 0.9127, change -12.4%)
+```
+
+Because the crops, sigmas and noise never change, differences of a few thousandths are real. Read it as
+follows: still falling = still learning; flat for several evaluations = done (stop, or lower the learning
+rate); rising after a minimum = over-training (use the checkpoint from the best step, `save_every` helps).
+For the planner the same line reports cross-entropy on fixed score crops; a value that keeps dropping
+toward 0.1 nats means the scores are being memorised.
+
+Turn on `tensorboard` to also log `loss/step`, `loss/avg20`, `loss/eval_fixed`, `lr` and `grad_norm` per
+step, plus the run configuration and final result as text. Runs land in `ComfyUI/output/yue2_tensorboard/<save_name>_<timestamp>`
 (`tensorboard_dir` changes the parent folder); view them with
 
 ```bash
 tensorboard --logdir ComfyUI/output/yue2_tensorboard
 ```
 
-The CLI equivalent is `--tensorboard DIR` (plus `--log-every N`, `--run-name`).
+The CLI equivalent is `--tensorboard DIR` (plus `--log-every N`, `--eval-every N`, `--eval-samples N`,
+`--run-name`); the CLI also writes the step and evaluation losses to `<out>.loss.json`.
 
 ### Choosing GPUs / training on both GPUs
 

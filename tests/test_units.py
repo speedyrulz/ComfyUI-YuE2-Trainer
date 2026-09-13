@@ -202,3 +202,65 @@ def test_chunk_ranges_keep_positions_in_context():
     for a, b in chunks:
         assert prefix_len + (b - a) + 1 + (b - a) + 2 <= CONTEXT   # last NAR position inside the context
     assert _chunk_ranges(100, 50) == [(0, 100)]
+
+
+def test_acoustic_eval_set_is_fixed_and_stratified():
+    import torch
+    from yue2_trainer.acoustic import AcousticConfig, _sigma_quantile, build_eval_set
+    cfg = AcousticConfig(eval_every=10, eval_samples=6, seed=3, timestep_sampling="uniform", shift=1.0)
+    chunks = [(0, 2000), (100, 600)]
+    a = build_eval_set(chunks, cfg, 750, cfg.seed)
+    b = build_eval_set(chunks, cfg, 750, cfg.seed)
+    assert len(a) == 6
+    assert [(e.index, e.offset, e.length, e.sigma) for e in a] == [(e.index, e.offset, e.length, e.sigma) for e in b]
+    assert all(torch.equal(x.noise, y.noise) for x, y in zip(a, b))
+    assert [e.sigma for e in a] == sorted(e.sigma for e in a)          # stratified quantiles
+    assert abs(a[0].sigma - 0.5 / 6) < 1e-6 and abs(a[-1].sigma - 5.5 / 6) < 1e-6
+    for e in a:
+        frames = chunks[e.index][1] - chunks[e.index][0]
+        assert e.length == min(750, frames) and 0 <= e.offset <= frames - e.length
+        assert e.noise.shape == (1, 64, e.length)
+    assert build_eval_set(chunks, AcousticConfig(eval_every=0), 750, 0) == []
+    ln = AcousticConfig(timestep_sampling="logit_normal", logit_mean=0.0, logit_std=1.0, shift=3.0)
+    qs = [_sigma_quantile(ln, q) for q in (0.1, 0.5, 0.9)]
+    assert qs == sorted(qs) and 0 < qs[0] < qs[-1] < 1
+    assert abs(_sigma_quantile(AcousticConfig(timestep_sampling="logit_normal"), 0.5) - 0.5) < 1e-6
+
+
+def test_planner_eval_set_keeps_prefix_and_is_fixed():
+    from yue2_trainer.planner import PlannerConfig, _Sequence, build_eval_set
+    seqs = [_Sequence(item=None, kind="abc", ids=list(range(1000, 1100)), loss_start=10),
+            _Sequence(item=None, kind="abc", ids=list(range(2000, 2020)), loss_start=5)]
+    cfg = PlannerConfig(eval_every=5, eval_samples=5, max_tokens=30, seed=1)
+    a = build_eval_set(seqs, cfg, cfg.seed)
+    assert a == build_eval_set(seqs, cfg, cfg.seed) and len(a) == 5
+    for ids, loss_start in a:
+        src = seqs[0] if ids[0] == 1000 else seqs[1]
+        assert ids[:src.loss_start] == src.ids[:src.loss_start]         # prefix always kept
+        assert len(ids) - src.loss_start <= 30 and loss_start >= src.loss_start
+    assert build_eval_set(seqs, PlannerConfig(eval_every=0), 0) == []
+
+
+def test_planner_crop_windows_cover_start_and_end():
+    import random
+    from yue2_trainer.planner import CROP_CONTEXT, _Sequence, _crop
+    seq = _Sequence(item=None, kind="abc", ids=list(range(10)) + list(range(100, 5100)), loss_start=10)  # 5000-token span
+    rng = random.Random(0)
+    heads = tails = mids = 0
+    for _ in range(300):
+        ids, loss_start = _crop(seq, 1024, rng)
+        assert ids[:10] == list(range(10)) and len(ids) == 10 + 1024
+        window_start = ids[10] - 100
+        if window_start == 0:
+            heads += 1
+            assert loss_start == 10
+        else:
+            assert loss_start == 10 + min(CROP_CONTEXT, 1024 // 4)     # mid-score windows start with context only
+            if ids[-1] == 5099:
+                tails += 1
+            else:
+                mids += 1
+        assert ids[loss_start:] == seq.ids[10 + window_start + (loss_start - 10): 10 + window_start + 1024]
+    assert heads > 50 and tails > 50 and mids > 30
+    short = _Sequence(item=None, kind="abc", ids=list(range(50)), loss_start=5)
+    assert _crop(short, 1024, rng) == (list(range(50)), 5)
