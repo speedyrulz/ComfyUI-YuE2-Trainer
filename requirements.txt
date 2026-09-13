@@ -1,3 +1,8 @@
-# Everything else (torch, safetensors, tokenizers, av, comfy-kitchen) comes with ComfyUI itself.
+# torch, transformers, safetensors, tokenizers, av and comfy-kitchen come with ComfyUI itself.
 soundfile>=0.12
 torchaudio
+librosa
+mutagen
+requests
+# optional: Claude-based [Verse]/[Chorus] tagging in Prepare Dataset
+anthropic

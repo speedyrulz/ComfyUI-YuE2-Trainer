@@ -22,6 +22,7 @@ from .yue2_trainer.constants import FRAMES_PER_SECOND
 from .yue2_trainer.dataset import Dataset, Item, cache_key, load_cache, save_cache, scan_folder
 from .yue2_trainer.lora import TARGET_PRESETS, load_lora_file, save_lora_file
 from .yue2_trainer.parallel import device_choices
+from .yue2_trainer.sidecars import DEFAULT_CLAUDE, SidecarConfig, WHISPER_CHOICES, prepare_folder, summarize
 from .yue2_trainer.planner import PlannerConfig, train_planner_lora
 
 DATASET = io.Custom("YUE2_DATASET")
@@ -87,6 +88,63 @@ class YuE2TrainerDatasetFolder(io.ComfyNode):
             if item.seconds is None and item.audio_path:
                 item.seconds = audio_seconds(item.audio_path)
         return io.NodeOutput(dataset, dataset.describe())
+
+
+class YuE2TrainerPrepareDataset(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="YuE2TrainerPrepareDataset",
+            display_name="YuE2 Prepare Dataset (auto style + lyrics)",
+            category=CATEGORY,
+            description="Writes .style.txt and .lyrics.txt sidecars for every song in a folder: lyrics from LRCLIB "
+                        "(by tags / 'Artist - Title' names) with Whisper transcription as fallback, section tags by "
+                        "repetition heuristic or Claude, style prompts from CLAP tags + tempo/key + language. "
+                        "Existing sidecars are kept unless overwrite is on. Outputs the scanned dataset.",
+            inputs=[
+                io.String.Input("folder", default="", tooltip="Absolute path, or a folder name inside ComfyUI/input."),
+                io.Combo.Input("lyrics_source", options=["lrclib+whisper", "lrclib", "whisper", "none"], default="lrclib+whisper"),
+                io.Combo.Input("whisper_model", options=WHISPER_CHOICES, default=WHISPER_CHOICES[0], advanced=True),
+                io.Combo.Input("section_tags", options=["heuristic", "claude", "none"], default="heuristic",
+                               tooltip="How [Verse]/[Chorus] tags are added. 'claude' uses the Anthropic API "
+                                       "(ANTHROPIC_API_KEY) and falls back to the heuristic on any failure."),
+                io.String.Input("claude_model", default=DEFAULT_CLAUDE, advanced=True),
+                io.Combo.Input("style_source", options=["clap", "none"], default="clap",
+                               tooltip="clap: genre/mood/instrument/vocal tags + BPM + language. none: use default_style."),
+                io.String.Input("default_style", multiline=True, default="", tooltip="Style text when style_source is none."),
+                io.Boolean.Input("overwrite", default=False, tooltip="Regenerate sidecars that already exist."),
+                io.Combo.Input("device", options=[d for d in device_choices() if d != "all"], default="auto"),
+                io.Boolean.Input("recursive", default=True),
+            ],
+            outputs=[DATASET.Output("dataset", display_name="dataset"), io.String.Output("report", display_name="report")],
+        )
+
+    @classmethod
+    def execute(cls, folder, lyrics_source, whisper_model, section_tags, claude_model, style_source, default_style,
+                overwrite, device, recursive):
+        path = Path(folder.strip().strip('"'))
+        if not path.is_absolute():
+            candidate = Path(folder_paths.get_input_directory()) / path
+            if candidate.is_dir():
+                path = candidate
+        cfg = SidecarConfig(lyrics_source=lyrics_source, whisper_model=whisper_model, style_source=style_source,
+                            section_tags=section_tags, claude_model=claude_model, default_style=default_style,
+                            overwrite=overwrite, device="auto" if device == "auto" else device)
+        if cfg.device == "auto":
+            cfg.device = str(comfy.model_management.get_torch_device())
+        comfy.model_management.unload_all_models()
+        pbar = comfy.utils.ProgressBar(1)
+
+        def progress(done, total, name):
+            pbar.update_absolute(done, total)
+
+        reports = prepare_folder(path, cfg, recursive=recursive, progress=progress, interrupt=_interrupt)
+        comfy.model_management.soft_empty_cache()
+        dataset = scan_folder(path, default_style, "", recursive)
+        for item in dataset.items:
+            if item.seconds is None and item.audio_path:
+                item.seconds = audio_seconds(item.audio_path)
+        return io.NodeOutput(dataset, summarize(reports))
 
 
 class YuE2TrainerDatasetFromAudio(io.ComfyNode):
@@ -435,6 +493,7 @@ class YuE2TrainerExtension(ComfyExtension):
     async def get_node_list(self):
         return [
             YuE2TrainerDatasetFolder,
+            YuE2TrainerPrepareDataset,
             YuE2TrainerDatasetFromAudio,
             YuE2TrainerDatasetMerge,
             YuE2TrainerEncodeDataset,

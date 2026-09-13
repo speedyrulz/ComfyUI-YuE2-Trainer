@@ -32,8 +32,8 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/speedyrulz/ComfyUI-YuE2-Trainer.git
 ```
 
-or drop/symlink this folder into `custom_nodes`. `soundfile` and `torchaudio` are the only extra
-dependencies (`pip install -r requirements.txt` with ComfyUI's Python); everything else ships with ComfyUI.
+or drop/symlink this folder into `custom_nodes`, then `pip install -r requirements.txt` with ComfyUI's Python
+(`soundfile`, `librosa`, `mutagen`, `requests`; `anthropic` only for Claude section tagging). Everything else ships with ComfyUI.
 
 ## Dataset
 
@@ -55,11 +55,31 @@ Output folders written by the native `yue2` runtime (`save_artifacts`: `request.
 and latents. That is the only source of semantic tokens: the audio-to-semantic tokenizer used to train
 YuE2 is not public (see *Limitations*).
 
+### Automatic style and lyrics sidecars
+
+**YuE2 Prepare Dataset** (node) or `prepare_dataset.py folder/` (CLI) writes the sidecars for you:
+
+| field | how it is produced |
+|---|---|
+| lyrics | LRCLIB lookup by the file's artist/title tags or an `Artist - Title` file name; Whisper (`large-v3-turbo` by default) transcribes anything not found. Tracks with almost no speech get an empty lyrics file (instrumental). |
+| `[Verse]` / `[Chorus]` tags | `heuristic` (repeated stanzas become choruses; long silent openings get `[Intro]`) or `claude` (Claude formats and fixes ASR slips; needs `ANTHROPIC_API_KEY`, falls back to the heuristic on any error) |
+| style | CLAP zero-shot tags (2 genres, 2 moods, up to 3 instruments, vocal type) + librosa tempo and key + the language Whisper detected, e.g. `Japanese, city pop, disco, upbeat, groovy, female vocal, synthesizer, bass guitar, 118 BPM` |
+
+Existing sidecars are never overwritten unless `overwrite` is on, so you can hand-correct files and rerun.
+The node outputs the scanned dataset (chain it into **YuE2 Encode Dataset**) plus a report that lists which files
+came from transcription and deserve a read-through; the folder also gets a `_prepare_report.json` with all tag
+scores. Models download from Hugging Face on first use (Whisper turbo about 1.6 GB, CLAP about 0.6 GB).
+
+```bash
+C:/ai/ComfyUI/venv/Scripts/python.exe prepare_dataset.py D:/songs --sections claude
+```
+
 ## Nodes (category `YuE2/training`)
 
 | Node | Purpose |
 |---|---|
 | **YuE2 Dataset From Folder** | Scan a folder (absolute path or a folder inside `ComfyUI/input`) into a `YUE2_DATASET`. |
+| **YuE2 Prepare Dataset** | Generate missing `.style.txt` / `.lyrics.txt` sidecars (LRCLIB + Whisper, CLAP tags) and output the scanned dataset. |
 | **YuE2 Dataset From Audio** | One-item dataset from a `LoadAudio` output plus style / lyrics / ABC (chain with `append_to`). |
 | **YuE2 Merge Datasets** | Concatenate two datasets. |
 | **YuE2 Encode Dataset** | VAE-encode every item to latents (cached under `output/yue2_trainer_cache`), optionally transcribe missing ABC with a SheetSage2 `AUDIO_ENCODER`. |
@@ -76,6 +96,7 @@ Ready-to-load API-format graphs are in [`example_workflows/`](example_workflows)
 or use *Load*; recent frontends import API-format JSON):
 
 - `yue2_train_acoustic_lora_api.json` – checkpoint → dataset → encode → acoustic LoRA → save + loss plot
+- `yue2_prepare_and_train_acoustic_api.json` – same, but **Prepare Dataset** generates the style/lyrics sidecars first
 - `yue2_train_planner_lora_api.json` – same with SheetSage2 transcription → planner LoRA
 - `yue2_generate_with_lora_api.json` – the stock YuE2 generation graph with **YuE2 Load LoRA** between the
   checkpoint loader and the YuE2 nodes
