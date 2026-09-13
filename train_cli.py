@@ -175,7 +175,7 @@ def main(argv=None):
     add_common(pa)
     pa.add_argument("--segment-seconds", type=float, default=30.0)
     pa.add_argument("--prefix-mode", default="auto", choices=["auto", "full", "melody", "off"])
-    pa.add_argument("--no-semantic", action="store_true", help="Ignore semantic tokens even when present.")
+    pa.add_argument("--use-semantic", action="store_true", help="Condition on semantic tokens for items that carry them.")
     pa.add_argument("--train-acoustic-head", action="store_true")
     pa.add_argument("--timestep-sampling", default="uniform", choices=["uniform", "logit_normal"])
     pa.add_argument("--shift", type=float, default=1.0)
@@ -229,7 +229,7 @@ def main(argv=None):
             cfg = AcousticConfig(steps=steps, batch_size=args.batch_size, grad_accumulation=args.grad_accumulation,
                                  learning_rate=args.lr, lr_schedule=args.lr_schedule, rank=args.rank, alpha=args.alpha, targets=args.targets,
                                  train_acoustic_head=args.train_acoustic_head, segment_seconds=args.segment_seconds,
-                                 mode=args.prefix_mode, use_semantic_tokens=not args.no_semantic,
+                                 mode=args.prefix_mode, use_semantic_tokens=args.use_semantic,
                                  timestep_sampling=args.timestep_sampling, shift=args.shift, warmup_steps=args.warmup,
                                  seed=args.seed, lora_dtype=args.lora_dtype,
                                  gradient_checkpointing=not args.no_checkpointing, optimizer=args.optimizer,

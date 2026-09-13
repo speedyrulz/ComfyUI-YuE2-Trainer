@@ -49,7 +49,7 @@
    ],
    "segment_seconds": 30.0,
    "prefix_mode": "auto",
-   "use_semantic_tokens": true,
+   "use_semantic_tokens": false,
    "train_acoustic_head": false,
    "timestep_sampling": "uniform",
    "shift": 1.0,

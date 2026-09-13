@@ -355,8 +355,9 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
                                tooltip="Random crop length per step; 0 trains on whole songs (needs more VRAM)."),
                 io.Combo.Input("prefix_mode", options=["auto", "full", "melody", "off"], default="auto",
                                tooltip="Chain-of-thought instruction for the prefix. auto: chords in ABC -> full, ABC -> melody, none -> off."),
-                io.Boolean.Input("use_semantic_tokens", default=True,
-                                 tooltip="Condition on semantic tokens when an item has them (YuE2 output folders)."),
+                io.Boolean.Input("use_semantic_tokens", default=False,
+                                 tooltip="Condition on YuE2 semantic tokens for items that carry them (only YuE2 output "
+                                         "folders do); otherwise text-only conditioning is used."),
                 io.Boolean.Input("train_acoustic_head", default=False,
                                  tooltip="Also adapt vae2llm / llm2vae / time embedder projections."),
                 io.Combo.Input("timestep_sampling", options=["uniform", "logit_normal"], default="uniform", advanced=True),

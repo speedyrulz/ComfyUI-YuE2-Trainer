@@ -114,8 +114,8 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   songs (more VRAM).
 - `prefix_mode` (auto): instruction used in the prompt prefix. `auto` uses `full` when the item's ABC has
   chord symbols, `melody` for a chord-free ABC, `off` when there is no ABC.
-- `use_semantic_tokens` (on): items with semantic tokens are conditioned exactly like inference (prefix +
-  codec tokens). Items without them use the model's codec-dropout ("text-only") conditioning: only the
+- `use_semantic_tokens` (off): when on, items with semantic tokens (YuE2 output folders) are conditioned exactly
+  like inference (prefix + codec tokens). Otherwise items use the model's codec-dropout ("text-only") conditioning: only the
   text/ABC prefix is visible, and the NAR tokens keep the positions they would have after the codec tokens.
 - `train_acoustic_head` (off): also adapt `vae2llm` / `llm2vae` / time embedder projections.
 - `timestep_sampling` / `shift`: sigma distribution (uniform by default, matching the reference solver).
