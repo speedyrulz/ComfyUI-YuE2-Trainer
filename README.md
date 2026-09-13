@@ -97,7 +97,7 @@ or use *Load*; recent frontends import API-format JSON):
 
 - `yue2_train_acoustic_lora_api.json` – checkpoint → dataset → encode → acoustic LoRA → save + loss plot
 - `yue2_prepare_and_train_acoustic_api.json` – same, but **Prepare Dataset** generates the style/lyrics sidecars first
-- `yue2_train_planner_lora_api.json` – same with SheetSage2 transcription → planner LoRA
+- `yue2_train_planner_lora_api.json` – same with SheetSage2 transcription (`full`, with chords) → planner LoRA
 - `yue2_generate_with_lora_api.json` – the stock YuE2 generation graph with **YuE2 Load LoRA** between the
   checkpoint loader and the YuE2 nodes
 
@@ -127,7 +127,7 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
 
 - `train_abc` (on): `style + lyrics -> ABC + </abc>`; the loss covers only the ABC tokens.
 - `train_semantic` (off): `style + lyrics + ABC -> semantic tokens` for items that carry them.
-- `abc_mode` (auto): `full` when the ABC contains chords, else `melody`.
+- `abc_mode` (full): the planning instruction the LoRA is trained under; match the mode you generate with. `auto` picks `full` when the score has chords, else `melody`.
 - `max_tokens` (4096): random crop of the trained span so long scores fit in memory.
 
 Both trainers use gradient checkpointing, bf16 autocast, fp32 LoRA weights, grad clipping, and run

@@ -35,7 +35,7 @@
     "9",
     0
    ],
-   "transcribe": "melody",
+   "transcribe": "full",
    "max_seconds": 0.0,
    "window_seconds": 60,
    "cache_dir": "yue2_trainer_cache",
@@ -55,7 +55,7 @@
    ],
    "train_abc": true,
    "train_semantic": false,
-   "abc_mode": "auto",
+   "abc_mode": "full",
    "max_tokens": 4096,
    "steps": 300,
    "learning_rate": 0.0001,

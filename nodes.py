@@ -207,8 +207,9 @@ class YuE2TrainerEncodeDataset(io.ComfyNode):
                 DATASET.Input("dataset"),
                 io.Vae.Input("vae", tooltip="The VAE from the YuE2 checkpoint."),
                 io.AudioEncoder.Input("audio_encoder", optional=True, tooltip="SheetSage2 (Load Audio Encoder) for transcription."),
-                io.Combo.Input("transcribe", options=["none", "melody", "full"], default="melody",
-                               tooltip="Transcribe items without an ABC score. melody = no chord symbols."),
+                io.Combo.Input("transcribe", options=["none", "melody", "full"], default="full",
+                               tooltip="Transcribe items without an ABC score. full = melody + chord symbols "
+                                       "(matches the default generation mode); melody = no chords (cover workflows)."),
                 io.Float.Input("max_seconds", default=0.0, min=0.0, max=900.0, step=1.0,
                                tooltip="Truncate each song to this many seconds (0 = whole song)."),
                 io.Int.Input("window_seconds", default=60, min=10, max=600,
@@ -413,8 +414,9 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
                 io.Boolean.Input("train_abc", default=True, tooltip="Train style+lyrics -> ABC score."),
                 io.Boolean.Input("train_semantic", default=False,
                                  tooltip="Train -> semantic codec tokens for items that have them (YuE2 output folders)."),
-                io.Combo.Input("abc_mode", options=["auto", "full", "melody"], default="auto",
-                               tooltip="Instruction used for ABC targets. auto: chords -> full, else melody."),
+                io.Combo.Input("abc_mode", options=["full", "melody", "auto"], default="full",
+                               tooltip="Planning instruction the LoRA is trained under; use the mode you generate with. "
+                                       "auto: chords in the score -> full, else melody."),
                 io.Int.Input("max_tokens", default=4096, min=64, max=20000,
                              tooltip="Random crop of the trained span (ABC or codec tokens) per step."),
                 *_common_training_inputs(1e-4, 300),

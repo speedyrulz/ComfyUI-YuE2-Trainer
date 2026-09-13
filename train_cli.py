@@ -183,7 +183,7 @@ def main(argv=None):
     add_common(pp)
     pp.add_argument("--no-abc", action="store_true", help="Do not train the ABC target.")
     pp.add_argument("--semantic", action="store_true", help="Also train the semantic-token target.")
-    pp.add_argument("--abc-mode", default="auto", choices=["auto", "full", "melody"])
+    pp.add_argument("--abc-mode", default="full", choices=["full", "melody", "auto"])
     pp.add_argument("--max-tokens", type=int, default=4096)
     args = parser.parse_args(argv)
 

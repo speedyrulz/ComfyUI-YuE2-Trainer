@@ -31,7 +31,7 @@ class PlannerConfig:
     targets: str = "attention+mlp"
     train_abc: bool = True             # style+lyrics -> ABC score
     train_semantic: bool = False       # style+lyrics(+ABC) -> semantic codec tokens (items with tokens only)
-    abc_mode: str = "auto"             # auto|full|melody
+    abc_mode: str = "full"             # full|melody|auto
     max_tokens: int = 4096             # crop of the trained span (ABC or codec tokens)
     weight_decay: float = 0.01
     lr_schedule: str = "cosine"         # cosine | constant | linear (warmup applies to all)
