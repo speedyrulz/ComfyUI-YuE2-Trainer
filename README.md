@@ -114,13 +114,16 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
 - `segment_seconds` (30): random crop per step. The crop keeps its absolute position inside the song
   (RoPE positions and the latent position table), so training crops look like inference. `0` trains whole
   songs (more VRAM).
-- `prefix_mode` (full): planning instruction used in the conditioning prefix; match the mode you generate with.
-  Items without an ABC score always use `off`. `auto` picks `full` when the ABC has chord symbols, else `melody`.
-- `conditioning` (inference_like): how the text-only training context is laid out. `inference_like` uses the
-  style + lyrics + ABC prefix, splits long songs into the same chunks generation would use, and places the NAR
-  tokens where they sit at generation (after that chunk's codec tokens). `compact` mimics the standalone
-  trainers: a `cot=off`, style-only prefix with the NAR tokens directly behind it and latent positions
-  restarting at every segment. Both are valid codec-dropout contexts; compare them on your data.
+- `conditioning` (compact): how the text-only training context is laid out. `compact` uses a `cot=off`,
+  style-only prefix with the NAR tokens directly behind it and latent positions restarting at every segment
+  (the regime of the standalone trainers; needs no ABC transcription or lyrics, 3x faster). `inference_like`
+  uses the style + lyrics + ABC prefix, splits long songs into the same chunks generation would use, and
+  places the NAR tokens where they sit at generation (after that chunk's codec tokens). In the A/B test
+  below both produced the same album similarity; keep `compact` unless you generate with a hand-written ABC
+  and want the LoRA to see scores during training.
+- `prefix_mode` (full, `inference_like` only): planning instruction used in the conditioning prefix; match
+  the mode you generate with. Items without an ABC score always use `off`. `auto` picks `full` when the ABC
+  has chord symbols, else `melody`.
 - `use_semantic_tokens` (off): when on, items with semantic tokens (YuE2 output folders) are conditioned exactly
   like inference (prefix + codec tokens). Otherwise items use the model's codec-dropout ("text-only") conditioning: only the
   text/ABC prefix is visible, and the NAR tokens keep the positions they would have after the codec tokens.
@@ -130,7 +133,10 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   generation time and regularises small datasets; 0 disables it.
 - `timestep_sampling` / `shift`: sigma distribution (uniform by default, matching the reference solver).
 - `rank`/`alpha` (16/16 → scale 1), `learning_rate` (1e-4), `lr_schedule` = `cosine` (decay to 10%), `constant`,
-  or `linear`; `warmup_steps` ramps up first in every mode. Same options on the planner node.
+  or `linear`; `warmup_steps` ramps up first in every mode. Same options on the planner node. Note that
+  ComfyUI's LoRA adapter initialises the fixed matrix about 8x larger than PEFT/kohya trainers do, so
+  `1e-4` here moves the weights roughly as much as `8e-4` would in a PEFT-style trainer (about 6% of the
+  weight norm after 1000 steps at rank 32); do not copy a higher learning rate from other trainers.
 - `save_every` writes `models/loras/<save_name>_<steps>.safetensors` checkpoints; `existing_lora` resumes.
 
 **Planner LoRA**
@@ -142,6 +148,38 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
 
 Both trainers use gradient checkpointing, bf16 autocast, fp32 LoRA weights, grad clipping, and run
 one item per micro-step (`batch_size × grad_accumulation` items per optimizer step).
+
+### What an acoustic LoRA can and cannot change
+
+Generation in ComfyUI is deterministic (same seed, same graph → bit-identical audio), so any difference you
+hear with the LoRA loaded is real. But the **composition is decided before the acoustic model runs**: the
+frozen AR stage writes the ABC score (or, with `cot=off`, goes straight to semantic tokens), and those
+tokens fix melody, chords, rhythm, arrangement and the vocal line. The acoustic LoRA only changes how that
+plan is rendered: timbre, guitar and drum sounds, vocal character, mix and production. With the same seed
+and prompt, every acoustic LoRA we measured (ours and the Starnodes trainer's, strength 1.0) kept a waveform
+correlation of 0.88-0.91 with the base render — the same song, re-recorded. That is the expected size of the
+effect; to change what YuE2 *writes*, train the planner LoRA on the same dataset and load both.
+
+Measured on 8 Master of Puppets songs (rank 32, 1000 steps, lr 1e-4, style prompt with the artist first,
+5 seeds, CLAP cosine to the album's audio embedding, higher = closer; seed-to-seed spread ±0.02):
+
+| LoRA (strength 1.0) | CLAP → album | Δ vs base, paired | corr with base render |
+|---|---|---|---|
+| none (base model) | 0.723 | – | 1.000 |
+| this trainer, `compact` (5.5 min) | 0.734 | +0.014 (3/4 seeds) | 0.879 |
+| this trainer, `inference_like` (17.5 min) | 0.733 | +0.016 (4/4 seeds) | 0.885 |
+| Starnodes ComfyUI-YuE2-Trainer (28 min, 24 GB) | 0.713 | -0.004 (1/4 seeds) | 0.911 |
+
+The pull toward the album is small but consistent, and slightly stronger at strength 1.5. Practical advice:
+
+- Put the artist (or your trigger word) first in the style prompt at generation, exactly as in the training
+  `.style.txt` files, and describe the sound rather than the genre alone.
+- Rank 32, 1000-3000 steps and strength 1.0-1.5 are good starting points; a LoRA that changes the sound too
+  much (muffled or noisy) is over-trained — lower the steps or the strength.
+- `full` planning mode is fine for LoRA generation. `cot=off` (no ABC) gave the same relative gain but much
+  lower album similarity overall for our prompt.
+- Songs longer than about 4 minutes used to be trained at RoPE positions far beyond anything generation
+  uses (a bug fixed in September 2026); retrain LoRAs made before that fix.
 
 ### Watching a run
 
@@ -225,7 +263,8 @@ unit tests.
   has not been released, so the semantic stage can only be trained on YuE2's own outputs (e.g. a
   best-of-N selection of songs you liked). For real recordings the acoustic LoRA is conditioned in
   text-only mode, which is a mode the base model was trained with (codec dropout) but not the mode used
-  at inference; expect it to transfer sound/timbre well and rhythm/phrasing less.
+  at inference; expect it to transfer sound/timbre and leave composition to the (frozen or planner-LoRA)
+  AR stage — see *What an acoustic LoRA can and cannot change* above.
 - **ABC transcription is only as good as SheetSage2.** It attends to a fixed 300-second window (about
   2 GB VRAM, roughly 20 s per 4-minute song) and can miss notes or meter; check `.abc` files you care
   about, or supply your own scores as sidecars.

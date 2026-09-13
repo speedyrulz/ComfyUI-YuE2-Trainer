@@ -182,7 +182,7 @@ def main(argv=None):
     add_common(pa)
     pa.add_argument("--segment-seconds", type=float, default=30.0)
     pa.add_argument("--prefix-mode", default="full", choices=["full", "melody", "off", "auto"])
-    pa.add_argument("--conditioning", default="inference_like", choices=["inference_like", "compact"])
+    pa.add_argument("--conditioning", default="compact", choices=["compact", "inference_like"])
     pa.add_argument("--use-semantic", action="store_true", help="Condition on semantic tokens for items that carry them.")
     pa.add_argument("--train-acoustic-head", action="store_true")
     pa.add_argument("--caption-dropout", type=float, default=0.1,

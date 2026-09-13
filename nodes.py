@@ -379,13 +379,15 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
                 DATASET.Input("dataset", tooltip="Encoded dataset (with latents)."),
                 io.Float.Input("segment_seconds", default=30.0, min=0.0, max=600.0, step=1.0,
                                tooltip="Random crop length per step; 0 trains on whole songs (needs more VRAM)."),
+                io.Combo.Input("conditioning", options=["compact", "inference_like"], default="compact",
+                               tooltip="compact: style-only prefix (cot off) with the NAR tokens right behind it and positions "
+                                       "restarting per segment; fast, needs no ABC/lyrics. inference_like: style+lyrics+ABC "
+                                       "prefix, song split into inference-sized chunks, NAR positions as at generation. "
+                                       "Both scored the same in A/B tests (see README)."),
                 io.Combo.Input("prefix_mode", options=["full", "melody", "off", "auto"], default="full",
-                               tooltip="Planning instruction in the conditioning prefix; match the mode you generate with. "
-                                       "Items without an ABC score always use off. auto: chords -> full, else melody."),
-                io.Combo.Input("conditioning", options=["inference_like", "compact"], default="inference_like",
-                               tooltip="inference_like: style+lyrics+ABC prefix, song split into inference-sized chunks, NAR "
-                                       "positions as at generation. compact: cot=off style-only prefix with the NAR right "
-                                       "behind it and positions restarting per segment (the regime of standalone trainers)."),
+                               tooltip="inference_like only: planning instruction in the conditioning prefix; match the mode "
+                                       "you generate with. Items without an ABC score always use off. auto: chords -> full, "
+                                       "else melody. Ignored by compact conditioning."),
                 io.Boolean.Input("use_semantic_tokens", default=False,
                                  tooltip="Condition on YuE2 semantic tokens for items that carry them (only YuE2 output "
                                          "folders do); otherwise text-only conditioning is used."),
@@ -404,7 +406,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, clip, dataset, segment_seconds, prefix_mode, conditioning, use_semantic_tokens, train_acoustic_head,
+    def execute(cls, model, clip, dataset, segment_seconds, conditioning, prefix_mode, use_semantic_tokens, train_acoustic_head,
                 caption_dropout, timestep_sampling, shift, steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
                 existing_lora, save_every, save_name, log_every, tensorboard, tensorboard_dir):

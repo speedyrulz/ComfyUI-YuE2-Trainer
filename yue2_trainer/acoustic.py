@@ -35,7 +35,7 @@ class AcousticConfig:
     train_acoustic_head: bool = False   # also adapt vae2llm / llm2vae / time embedder
     segment_seconds: float = 30.0       # random crop length (0 = whole song / chunk)
     mode: str = "full"                  # full|melody|off|auto  (CoT instruction used for the prefix)
-    conditioning: str = "inference_like"  # inference_like | compact  (see README: acoustic conditioning regimes)
+    conditioning: str = "compact"       # compact | inference_like  (see README: acoustic conditioning regimes)
     use_semantic_tokens: bool = False   # condition on semantic tokens for items that carry them
     caption_dropout: float = 0.1        # probability of training a step on the unconditional (instruction-only) prefix
     timestep_sampling: str = "uniform"  # uniform | logit_normal
