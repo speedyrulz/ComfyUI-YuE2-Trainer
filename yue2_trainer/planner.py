@@ -34,6 +34,7 @@ class PlannerConfig:
     abc_mode: str = "auto"             # auto|full|melody
     max_tokens: int = 4096             # crop of the trained span (ABC or codec tokens)
     weight_decay: float = 0.01
+    lr_schedule: str = "cosine"         # cosine | constant | linear (warmup applies to all)
     warmup_steps: int = 10
     max_grad_norm: float = 1.0
     seed: int = 0
@@ -174,7 +175,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             if interrupt_check is not None:
                 interrupt_check()
             for group in optimizer.param_groups:
-                group["lr"] = _lr_at(step, cfg.steps, cfg.warmup_steps, cfg.learning_rate)
+                group["lr"] = _lr_at(step, cfg.steps, cfg.warmup_steps, cfg.learning_rate, cfg.lr_schedule)
             optimizer.zero_grad(set_to_none=True)
             loss_sum = run_on_replicas(replicas, work_fn, counts)
             reduce_gradients(replicas)
@@ -206,7 +207,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
         adapter.requires_grad_(False)
     info = {"kind": "planner", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets, "steps": cfg.steps,
             "sequences": len(sequences), "train_abc": cfg.train_abc, "train_semantic": cfg.train_semantic,
-            "max_tokens": cfg.max_tokens, "learning_rate": cfg.learning_rate,
+            "max_tokens": cfg.max_tokens, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
             "tensorboard": str(monitor.log_dir) if monitor.log_dir else None}
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,

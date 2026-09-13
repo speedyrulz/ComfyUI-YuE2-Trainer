@@ -39,6 +39,7 @@ class AcousticConfig:
     logit_mean: float = 0.0
     logit_std: float = 1.0
     weight_decay: float = 0.01
+    lr_schedule: str = "cosine"          # cosine | constant | linear (warmup applies to all)
     warmup_steps: int = 10
     max_grad_norm: float = 1.0
     seed: int = 0
@@ -90,11 +91,24 @@ def _make_optimizer(name: str, params, lr: float, weight_decay: float):
     return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
 
-def _lr_at(step: int, total: int, warmup: int, base: float) -> float:
+LR_SCHEDULES = ["cosine", "constant", "linear"]
+
+
+def _lr_at(step: int, total: int, warmup: int, base: float, schedule: str = "cosine") -> float:
+    """Learning rate for 0-based ``step``. Warmup ramps linearly for ``warmup`` steps in every schedule.
+
+    cosine:   decays from base to 10% of base with a half-cosine
+    constant: stays at base
+    linear:   decays from base to 10% of base in a straight line
+    """
     if warmup > 0 and step < warmup:
         return base * (step + 1) / warmup
-    progress = (step - warmup) / max(1, total - warmup)
-    return base * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
+    if schedule == "constant":
+        return base
+    progress = min(1.0, (step - warmup) / max(1, total - warmup))
+    if schedule == "linear":
+        return base * (1.0 - 0.9 * progress)
+    return base * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 
 def _chunk_bounds(item: Item, prefix_len: int) -> list[tuple[int, int]]:
@@ -248,7 +262,7 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             if interrupt_check is not None:
                 interrupt_check()
             for group in optimizer.param_groups:
-                group["lr"] = _lr_at(step, cfg.steps, cfg.warmup_steps, cfg.learning_rate)
+                group["lr"] = _lr_at(step, cfg.steps, cfg.warmup_steps, cfg.learning_rate, cfg.lr_schedule)
             optimizer.zero_grad(set_to_none=True)
             loss_sum = run_on_replicas(replicas, work, counts)
             reduce_gradients(replicas)
@@ -281,7 +295,7 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     info = {"kind": "acoustic", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets,
             "train_acoustic_head": cfg.train_acoustic_head, "steps": cfg.steps, "items": len(dataset.with_latents()),
             "chunks": len(samples), "segment_seconds": cfg.segment_seconds, "timestep_sampling": cfg.timestep_sampling,
-            "shift": cfg.shift, "learning_rate": cfg.learning_rate, "mode": cfg.mode,
+            "shift": cfg.shift, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule, "mode": cfg.mode,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
             "tensorboard": str(monitor.log_dir) if monitor.log_dir else None,
             "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids))}

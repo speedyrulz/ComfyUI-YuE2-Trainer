@@ -76,7 +76,8 @@
    "devices": "auto",
    "log_every": 1,
    "tensorboard": false,
-   "tensorboard_dir": "yue2_tensorboard"
+   "tensorboard_dir": "yue2_tensorboard",
+   "lr_schedule": "cosine"
   }
  },
  "5": {

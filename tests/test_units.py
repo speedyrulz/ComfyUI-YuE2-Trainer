@@ -173,3 +173,15 @@ def test_chunked_cross_entropy():
     assert torch.allclose(ref, got, atol=1e-5)
     got.backward()
     assert h.grad is not None and torch.isfinite(h.grad).all()
+
+
+def test_lr_schedules():
+    from yue2_trainer.acoustic import _lr_at
+    base = 1e-3
+    assert _lr_at(0, 100, 10, base, "constant") == base * 0.1        # warmup applies to all schedules
+    assert _lr_at(50, 100, 10, base, "constant") == base
+    assert _lr_at(99, 100, 10, base, "constant") == base
+    assert abs(_lr_at(10, 100, 10, base, "cosine") - base) < 1e-12
+    assert abs(_lr_at(100, 100, 10, base, "cosine") - 0.1 * base) < 1e-12
+    assert abs(_lr_at(100, 100, 10, base, "linear") - 0.1 * base) < 1e-12
+    assert abs(_lr_at(55, 100, 10, base, "linear") - 0.55 * base) < 1e-12

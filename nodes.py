@@ -16,7 +16,7 @@ import comfy.utils
 import folder_paths
 from comfy_api.latest import ComfyExtension, io
 
-from .yue2_trainer.acoustic import AcousticConfig, train_acoustic_lora
+from .yue2_trainer.acoustic import LR_SCHEDULES, AcousticConfig, train_acoustic_lora
 from .yue2_trainer.audio import audio_seconds, crop_audio, encode_latents, load_audio, to_stereo_48k
 from .yue2_trainer.constants import FRAMES_PER_SECOND
 from .yue2_trainer.dataset import Dataset, Item, cache_key, load_cache, save_cache, scan_folder
@@ -302,6 +302,9 @@ def _common_training_inputs(default_lr, default_steps):
     return [
         io.Int.Input("steps", default=default_steps, min=1, max=100000),
         io.Float.Input("learning_rate", default=default_lr, min=1e-7, max=1.0, step=1e-6),
+        io.Combo.Input("lr_schedule", options=LR_SCHEDULES, default="cosine",
+                       tooltip="cosine: decay to 10% of learning_rate; constant: no decay; linear: straight-line "
+                               "decay to 10%. warmup_steps ramps up first in all modes."),
         io.Int.Input("rank", default=16, min=1, max=256),
         io.Float.Input("alpha", default=16.0, min=0.01, max=1024.0, step=0.5,
                        tooltip="LoRA alpha; effective scale is alpha / rank."),
@@ -365,11 +368,12 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, clip, dataset, segment_seconds, prefix_mode, use_semantic_tokens, train_acoustic_head,
-                timestep_sampling, shift, steps, learning_rate, rank, alpha, targets, batch_size, grad_accumulation,
+                timestep_sampling, shift, steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
                 existing_lora, save_every, save_name, log_every, tensorboard, tensorboard_dir):
         cfg = AcousticConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
+            lr_schedule=lr_schedule,
             rank=rank, alpha=alpha, targets=targets, train_acoustic_head=train_acoustic_head,
             segment_seconds=segment_seconds, mode=prefix_mode, use_semantic_tokens=use_semantic_tokens,
             timestep_sampling=timestep_sampling, shift=shift, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
@@ -418,12 +422,14 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, clip, dataset, train_abc, train_semantic, abc_mode, max_tokens, steps, learning_rate, rank, alpha,
+    def execute(cls, clip, dataset, train_abc, train_semantic, abc_mode, max_tokens, steps, learning_rate, lr_schedule,
+                rank, alpha,
                 targets, batch_size, grad_accumulation, warmup_steps, seed, optimizer, lora_dtype,
                 gradient_checkpointing, max_grad_norm, devices, existing_lora, save_every, save_name, log_every,
                 tensorboard, tensorboard_dir):
         cfg = PlannerConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
+            lr_schedule=lr_schedule,
             rank=rank, alpha=alpha, targets=targets, train_abc=train_abc, train_semantic=train_semantic,
             abc_mode=abc_mode, max_tokens=max_tokens, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,

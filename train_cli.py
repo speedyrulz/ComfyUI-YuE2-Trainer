@@ -145,6 +145,7 @@ def add_common(p):
     p.add_argument("--sheetsage", default="sheetsage2_bf16.safetensors")
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr-schedule", default="cosine", choices=["cosine", "constant", "linear"])
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--alpha", type=float, default=16.0)
     p.add_argument("--targets", default="attention+mlp", choices=["attention", "attention+mlp", "mlp"])
@@ -226,7 +227,7 @@ def main(argv=None):
         if args.command == "acoustic":
             from yue2_trainer.acoustic import AcousticConfig, train_acoustic_lora
             cfg = AcousticConfig(steps=steps, batch_size=args.batch_size, grad_accumulation=args.grad_accumulation,
-                                 learning_rate=args.lr, rank=args.rank, alpha=args.alpha, targets=args.targets,
+                                 learning_rate=args.lr, lr_schedule=args.lr_schedule, rank=args.rank, alpha=args.alpha, targets=args.targets,
                                  train_acoustic_head=args.train_acoustic_head, segment_seconds=args.segment_seconds,
                                  mode=args.prefix_mode, use_semantic_tokens=not args.no_semantic,
                                  timestep_sampling=args.timestep_sampling, shift=args.shift, warmup_steps=args.warmup,
@@ -239,7 +240,7 @@ def main(argv=None):
         else:
             from yue2_trainer.planner import PlannerConfig, train_planner_lora
             cfg = PlannerConfig(steps=steps, batch_size=args.batch_size, grad_accumulation=args.grad_accumulation,
-                                learning_rate=args.lr, rank=args.rank, alpha=args.alpha, targets=args.targets,
+                                learning_rate=args.lr, lr_schedule=args.lr_schedule, rank=args.rank, alpha=args.alpha, targets=args.targets,
                                 train_abc=not args.no_abc, train_semantic=args.semantic, abc_mode=args.abc_mode,
                                 max_tokens=args.max_tokens, warmup_steps=args.warmup, seed=args.seed,
                                 lora_dtype=args.lora_dtype, gradient_checkpointing=not args.no_checkpointing,

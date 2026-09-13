@@ -119,7 +119,8 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   text/ABC prefix is visible, and the NAR tokens keep the positions they would have after the codec tokens.
 - `train_acoustic_head` (off): also adapt `vae2llm` / `llm2vae` / time embedder projections.
 - `timestep_sampling` / `shift`: sigma distribution (uniform by default, matching the reference solver).
-- `rank`/`alpha` (16/16 → scale 1), `learning_rate` (1e-4), cosine schedule with `warmup_steps`.
+- `rank`/`alpha` (16/16 → scale 1), `learning_rate` (1e-4), `lr_schedule` = `cosine` (decay to 10%), `constant`,
+  or `linear`; `warmup_steps` ramps up first in every mode. Same options on the planner node.
 - `save_every` writes `models/loras/<save_name>_<steps>.safetensors` checkpoints; `existing_lora` resumes.
 
 **Planner LoRA**
