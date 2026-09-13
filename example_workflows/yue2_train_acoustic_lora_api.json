@@ -75,7 +75,8 @@
    "tensorboard": false,
    "tensorboard_dir": "yue2_tensorboard",
    "lr_schedule": "cosine",
-   "caption_dropout": 0.1
+   "caption_dropout": 0.1,
+   "conditioning": "inference_like"
   }
  },
  "5": {

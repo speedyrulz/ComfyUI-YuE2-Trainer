@@ -116,6 +116,11 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   songs (more VRAM).
 - `prefix_mode` (full): planning instruction used in the conditioning prefix; match the mode you generate with.
   Items without an ABC score always use `off`. `auto` picks `full` when the ABC has chord symbols, else `melody`.
+- `conditioning` (inference_like): how the text-only training context is laid out. `inference_like` uses the
+  style + lyrics + ABC prefix, splits long songs into the same chunks generation would use, and places the NAR
+  tokens where they sit at generation (after that chunk's codec tokens). `compact` mimics the standalone
+  trainers: a `cot=off`, style-only prefix with the NAR tokens directly behind it and latent positions
+  restarting at every segment. Both are valid codec-dropout contexts; compare them on your data.
 - `use_semantic_tokens` (off): when on, items with semantic tokens (YuE2 output folders) are conditioned exactly
   like inference (prefix + codec tokens). Otherwise items use the model's codec-dropout ("text-only") conditioning: only the
   text/ABC prefix is visible, and the NAR tokens keep the positions they would have after the codec tokens.

@@ -59,7 +59,7 @@ class Item:
             parts.append(f"{self.seconds:.1f}s")
         if self.latents is not None:
             parts.append(f"latents={self.frames}f")
-        parts.append("abc" if self.abc else "no-abc")
+        parts.append("abc" if self.abc else ("abc-failed" if self.extra.get("abc_error") else "no-abc"))
         if self.semantic is not None:
             parts.append(f"semantic={len(self.semantic)}")
         return " | ".join(parts)

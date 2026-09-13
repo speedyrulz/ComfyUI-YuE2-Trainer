@@ -18,7 +18,9 @@ from .lora import create_lora, select_target_modules, count_parameters
 from .monitor import TrainMonitor
 from .parallel import (Replica, clone_patcher_for_device, free_replicas, reduce_gradients, resolve_devices,
                        run_on_replicas, split_counts, sync_lora_weights)
-from .prefix import PrefixCache, build_acoustic_prefix, load_clip_for_prefill, music_prefix_ids, resolve_mode
+from .constants import MUSIC_END
+from .prefix import (PrefixCache, build_acoustic_prefix, compute_prefix_kv, load_clip_for_prefill, music_prefix_ids,
+                     negative_prefix_ids, resolve_mode)
 
 
 @dataclass
@@ -33,6 +35,7 @@ class AcousticConfig:
     train_acoustic_head: bool = False   # also adapt vae2llm / llm2vae / time embedder
     segment_seconds: float = 30.0       # random crop length (0 = whole song / chunk)
     mode: str = "full"                  # full|melody|off|auto  (CoT instruction used for the prefix)
+    conditioning: str = "inference_like"  # inference_like | compact  (see README: acoustic conditioning regimes)
     use_semantic_tokens: bool = False   # condition on semantic tokens for items that carry them
     caption_dropout: float = 0.1        # probability of training a step on the unconditional (instruction-only) prefix
     timestep_sampling: str = "uniform"  # uniform | logit_normal
@@ -112,19 +115,19 @@ def _lr_at(step: int, total: int, warmup: int, base: float, schedule: str = "cos
     return base * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 
-def _chunk_bounds(item: Item, prefix_len: int) -> list[tuple[int, int]]:
-    """Original inference chunking (comfy.text_encoders.yue2.chunk_ranges)."""
-    frames = item.frames
-    size = (CONTEXT - prefix_len - 3) // 2
-    return [(s, min(s + size, frames)) for s in range(0, frames, size)]
-
-
 @dataclass
 class _Sample:
     item: Item
     prefix: PrefixCache
     chunk: tuple[int, int]
     uncond: Optional[PrefixCache] = None   # instruction-only prefix for caption dropout
+    compact: bool = False                  # positions restart at the segment (compact regime)
+
+
+def _chunk_ranges(frames: int, prefix_len: int) -> list[tuple[int, int]]:
+    """Original inference chunking (comfy.text_encoders.yue2.chunk_ranges): keeps every position inside the context."""
+    size = max(1, (CONTEXT - prefix_len - 3) // 2)
+    return [(s, min(s + size, frames)) for s in range(0, frames, size)]
 
 
 def prepare_samples(clip, dataset: Dataset, cfg: AcousticConfig, progress=None) -> list[_Sample]:
@@ -144,7 +147,7 @@ def prepare_samples(clip, dataset: Dataset, cfg: AcousticConfig, progress=None) 
         if semantic is not None:
             n = min(len(semantic), item.frames)
             prefix_ids, _ = music_prefix_ids(clip, item.style, item.lyrics, abc, cot)
-            for chunk in _chunk_bounds(item, len(prefix_ids)):
+            for chunk in _chunk_ranges(item.frames, len(prefix_ids)):
                 chunk = (chunk[0], min(chunk[1], n))
                 if chunk[1] <= chunk[0]:
                     continue
@@ -155,13 +158,31 @@ def prepare_samples(clip, dataset: Dataset, cfg: AcousticConfig, progress=None) 
                     uncond = build_acoustic_prefix(clip, item.style, item.lyrics, abc, cot, semantic=semantic[:n],
                                                    chunk=chunk, device=device, unconditional=True)
                 samples.append(_Sample(item, prefix, chunk, uncond))
-        else:
-            prefix = build_acoustic_prefix(clip, item.style, item.lyrics, abc, cot, total_frames=item.frames, device=device)
+        elif cfg.conditioning == "compact":
+            # The regime of the standalone trainers: cot=off, style only, MUSIC_END right after MUSIC_START,
+            # the NAR tokens immediately after the prefix and latent positions restarting at every segment.
+            ids = music_prefix_ids(clip, item.style, "", None, "off")[0] + [MUSIC_END]
+            prefix = PrefixCache(ids=ids, kv=compute_prefix_kv(clip, ids, device=device), ar_length=len(ids))
             uncond = None
             if cfg.caption_dropout > 0:
-                uncond = build_acoustic_prefix(clip, item.style, item.lyrics, abc, cot, total_frames=item.frames,
-                                               device=device, unconditional=True)
-            samples.append(_Sample(item, prefix, (0, item.frames), uncond))
+                uids = negative_prefix_ids(clip, [], "off") + [MUSIC_END]
+                uncond = PrefixCache(ids=uids, kv=compute_prefix_kv(clip, uids, device=device), ar_length=len(uids))
+            samples.append(_Sample(item, prefix, (0, item.frames), uncond, compact=True))
+        else:
+            # Text-only (codec-dropout) regime with inference geometry: the song is split into the same chunks
+            # inference would use, and the NAR tokens keep the positions they would have after that chunk's
+            # codec tokens. One prefix K/V cache is shared by all chunks of the item.
+            prefix_ids, abc_ids = music_prefix_ids(clip, item.style, item.lyrics, abc, cot)
+            kv = compute_prefix_kv(clip, prefix_ids, device=device)
+            ukv = None
+            if cfg.caption_dropout > 0:
+                uids = negative_prefix_ids(clip, abc_ids, cot)
+                ukv = (uids, compute_prefix_kv(clip, uids, device=device))
+            for c0, c1 in _chunk_ranges(item.frames, len(prefix_ids)):
+                ar_length = len(prefix_ids) + (c1 - c0) + 1
+                prefix = PrefixCache(ids=prefix_ids, kv=kv, ar_length=ar_length)
+                uncond = PrefixCache(ids=ukv[0], kv=ukv[1], ar_length=len(ukv[0]) + (c1 - c0) + 1) if ukv else None
+                samples.append(_Sample(item, prefix, (c0, c1), uncond))
         if progress is not None:
             progress(index + 1, len(items))
     return samples
@@ -252,7 +273,7 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             "train_acoustic_head": cfg.train_acoustic_head, "steps": cfg.steps, "items": len(dataset.with_latents()),
             "chunks": len(samples), "segment_seconds": cfg.segment_seconds, "timestep_sampling": cfg.timestep_sampling,
             "shift": cfg.shift, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule, "mode": cfg.mode,
-            "caption_dropout": cfg.caption_dropout,
+            "caption_dropout": cfg.caption_dropout, "conditioning": cfg.conditioning,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
             "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids))}
 
@@ -284,7 +305,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             prefix_kv = prefix.kv.to(device, non_blocking=True).clone()
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 pred = nar_forward(dm, x_t.to(torch.bfloat16), sigma, prefix_kv, prefix.ar_length,
-                                   frame_offset=offset, checkpointing=cfg.gradient_checkpointing)
+                                   frame_offset=0 if sample.compact else offset,
+                                   checkpointing=cfg.gradient_checkpointing)
             loss = torch.nn.functional.mse_loss(pred.float(), target)
             (loss / micro_steps).backward()
             total += loss.detach()

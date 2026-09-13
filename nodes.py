@@ -283,14 +283,21 @@ class YuE2TrainerEncodeDataset(io.ComfyNode):
                             wave, sr = item.extra["waveform"], item.extra["sample_rate"]
                         waveform = crop_audio(to_stereo_48k(wave, sr), max_seconds)
                     with torch.inference_mode():
-                        scores = audio_encoder.generate_abc(waveform[None], 48000, melody_only=transcribe == "melody")
-                    item.abc = scores[0] if isinstance(scores, (list, tuple)) else scores
-                    payload = dict(cached or {})
-                    payload[cache_field] = item.abc
-                    if "latents" not in payload:
-                        payload["latents"] = item.latents
-                    save_cache(cache, key, payload)
-                    cached = payload
+                        try:
+                            scores = audio_encoder.generate_abc(waveform[None], 48000, melody_only=transcribe == "melody")
+                            item.abc = scores[0] if isinstance(scores, (list, tuple)) else scores
+                        except Exception as exc:  # noqa: BLE001 - SheetSage2 can fail to rebuild an ABC for some songs
+                            logging.warning("YuE2 trainer: SheetSage2 transcription failed for %s (%s); training without an ABC score",
+                                            item.id, exc)
+                            item.abc = None
+                            item.extra["abc_error"] = str(exc)
+                        else:
+                            payload = dict(cached or {})
+                            payload[cache_field] = item.abc
+                            if "latents" not in payload:
+                                payload["latents"] = item.latents
+                            save_cache(cache, key, payload)
+                            cached = payload
             if item.semantic is not None and abs(len(item.semantic) - item.latents.shape[-1]) > 2:
                 logging.warning("YuE2 trainer: %s semantic tokens (%d) do not match latent frames (%d)",
                                 item.id, len(item.semantic), item.latents.shape[-1])
@@ -375,6 +382,10 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
                 io.Combo.Input("prefix_mode", options=["full", "melody", "off", "auto"], default="full",
                                tooltip="Planning instruction in the conditioning prefix; match the mode you generate with. "
                                        "Items without an ABC score always use off. auto: chords -> full, else melody."),
+                io.Combo.Input("conditioning", options=["inference_like", "compact"], default="inference_like",
+                               tooltip="inference_like: style+lyrics+ABC prefix, song split into inference-sized chunks, NAR "
+                                       "positions as at generation. compact: cot=off style-only prefix with the NAR right "
+                                       "behind it and positions restarting per segment (the regime of standalone trainers)."),
                 io.Boolean.Input("use_semantic_tokens", default=False,
                                  tooltip="Condition on YuE2 semantic tokens for items that carry them (only YuE2 output "
                                          "folders do); otherwise text-only conditioning is used."),
@@ -393,7 +404,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, clip, dataset, segment_seconds, prefix_mode, use_semantic_tokens, train_acoustic_head,
+    def execute(cls, model, clip, dataset, segment_seconds, prefix_mode, conditioning, use_semantic_tokens, train_acoustic_head,
                 caption_dropout, timestep_sampling, shift, steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
                 existing_lora, save_every, save_name, log_every, tensorboard, tensorboard_dir):
@@ -401,7 +412,8 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             lr_schedule=lr_schedule,
             rank=rank, alpha=alpha, targets=targets, train_acoustic_head=train_acoustic_head,
-            segment_seconds=segment_seconds, mode=prefix_mode, use_semantic_tokens=use_semantic_tokens,
+            segment_seconds=segment_seconds, mode=prefix_mode, conditioning=conditioning,
+            use_semantic_tokens=use_semantic_tokens,
             caption_dropout=caption_dropout,
             timestep_sampling=timestep_sampling, shift=shift, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,

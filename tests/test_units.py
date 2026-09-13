@@ -190,3 +190,15 @@ def test_lr_schedules():
 def test_lr_schedule_names_exported():
     from yue2_trainer.acoustic import LR_SCHEDULES, AcousticConfig
     assert AcousticConfig().caption_dropout == 0.1 and "constant" in LR_SCHEDULES
+
+
+def test_chunk_ranges_keep_positions_in_context():
+    from yue2_trainer.acoustic import _chunk_ranges
+    from yue2_trainer.constants import CONTEXT
+    prefix_len, frames = 8400, 12834          # an 8.5-minute song with a long ABC transcription
+    chunks = _chunk_ranges(frames, prefix_len)
+    assert chunks[0][0] == 0 and chunks[-1][1] == frames
+    assert all(b - a >= 1 for a, b in chunks)
+    for a, b in chunks:
+        assert prefix_len + (b - a) + 1 + (b - a) + 2 <= CONTEXT   # last NAR position inside the context
+    assert _chunk_ranges(100, 50) == [(0, 100)]

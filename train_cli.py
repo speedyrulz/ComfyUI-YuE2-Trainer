@@ -95,13 +95,18 @@ def encode_dataset(dataset, vae, args, audio_encoder=None):
                     wave, sr = load_audio(item.audio_path)
                     waveform = crop_audio(to_stereo_48k(wave, sr), args.max_seconds)
                 with torch.inference_mode():
-                    scores = audio_encoder.generate_abc(waveform[None], 48000, melody_only=args.transcribe == "melody")
-                item.abc = scores[0] if isinstance(scores, (list, tuple)) else scores
-                cached = dict(cached or {})
-                cached[field] = item.abc
-                cached.setdefault("latents", item.latents)
-                save_cache(cache, key, cached)
-                logging.info("transcribed %s: %d ABC chars", item.id, len(item.abc or ""))
+                    try:
+                        scores = audio_encoder.generate_abc(waveform[None], 48000, melody_only=args.transcribe == "melody")
+                        item.abc = scores[0] if isinstance(scores, (list, tuple)) else scores
+                    except Exception as exc:  # noqa: BLE001
+                        logging.warning("SheetSage2 transcription failed for %s (%s); training without an ABC score", item.id, exc)
+                        item.abc = None
+                        continue
+                    cached = dict(cached or {})
+                    cached[field] = item.abc
+                    cached.setdefault("latents", item.latents)
+                    save_cache(cache, key, cached)
+                    logging.info("transcribed %s: %d ABC chars", item.id, len(item.abc or ""))
     return dataset
 
 
@@ -177,6 +182,7 @@ def main(argv=None):
     add_common(pa)
     pa.add_argument("--segment-seconds", type=float, default=30.0)
     pa.add_argument("--prefix-mode", default="full", choices=["full", "melody", "off", "auto"])
+    pa.add_argument("--conditioning", default="inference_like", choices=["inference_like", "compact"])
     pa.add_argument("--use-semantic", action="store_true", help="Condition on semantic tokens for items that carry them.")
     pa.add_argument("--train-acoustic-head", action="store_true")
     pa.add_argument("--caption-dropout", type=float, default=0.1,
@@ -233,7 +239,8 @@ def main(argv=None):
             cfg = AcousticConfig(steps=steps, batch_size=args.batch_size, grad_accumulation=args.grad_accumulation,
                                  learning_rate=args.lr, lr_schedule=args.lr_schedule, rank=args.rank, alpha=args.alpha, targets=args.targets,
                                  train_acoustic_head=args.train_acoustic_head, segment_seconds=args.segment_seconds,
-                                 mode=args.prefix_mode, use_semantic_tokens=args.use_semantic,
+                                 mode=args.prefix_mode, conditioning=args.conditioning,
+                                 use_semantic_tokens=args.use_semantic,
                                  caption_dropout=args.caption_dropout,
                                  timestep_sampling=args.timestep_sampling, shift=args.shift, warmup_steps=args.warmup,
                                  seed=args.seed, lora_dtype=args.lora_dtype,
