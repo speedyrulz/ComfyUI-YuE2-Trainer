@@ -150,6 +150,11 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
                         "raise it to keep every GPU busy", micro_steps, len(devices))
     counts = split_counts(micro_steps, len(replicas))
     losses = []
+    info = {"kind": "planner", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets, "steps": cfg.steps,
+            "sequences": len(sequences), "train_abc": cfg.train_abc, "train_semantic": cfg.train_semantic,
+            "max_tokens": cfg.max_tokens, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule,
+            "devices": [str(d) for d in devices], "micro_steps": micro_steps,
+            }
     monitor = TrainMonitor("planner", cfg.steps, cfg.log_every, cfg.tensorboard_dir or None, cfg.run_name,
                            config={k: v for k, v in vars(cfg).items() if k not in ("existing_lora", "save_callback")})
 
@@ -189,7 +194,8 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             if progress is not None:
                 progress(step + 1, cfg.steps, step_loss)
             if cfg.save_every and cfg.save_callback and (step + 1) % cfg.save_every == 0 and step + 1 < cfg.steps:
-                cfg.save_callback(primary.lora.export(), step + 1)
+                cfg.save_callback(primary.lora.export(), step + 1,
+                                  {**info, "steps": step + 1, "partial": True, "loss": step_loss})
     finally:
         comfy.model_management.in_training = False
         monitor.close()
@@ -206,11 +212,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
     exported = primary.lora.export()
     for adapter in primary.lora.adapters:
         adapter.requires_grad_(False)
-    info = {"kind": "planner", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets, "steps": cfg.steps,
-            "sequences": len(sequences), "train_abc": cfg.train_abc, "train_semantic": cfg.train_semantic,
-            "max_tokens": cfg.max_tokens, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule,
-            "devices": [str(d) for d in devices], "micro_steps": micro_steps,
-            "tensorboard": str(monitor.log_dir) if monitor.log_dir else None}
+    info["tensorboard"] = str(monitor.log_dir) if monitor.log_dir else None
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,
                        seconds=time.perf_counter() - start_time, info=info)
 

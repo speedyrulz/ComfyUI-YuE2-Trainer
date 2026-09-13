@@ -60,7 +60,7 @@ def _tensorboard_dir(enabled: bool, folder: str):
 
 def _save_checkpoint(lora_sd, name: str, steps: int, info: dict) -> str:
     target = _lora_dir() / f"{name}_{steps:06d}.safetensors"
-    save_lora_file(lora_sd, target, {**info, "steps": steps, "partial": True})
+    save_lora_file(lora_sd, target, info)
     logging.info("YuE2 trainer: saved intermediate LoRA %s", target)
     return str(target)
 
@@ -408,8 +408,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
             log_every=log_every, tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
-        info_holder = {}
-        cfg.save_callback = lambda sd, n: _save_checkpoint(sd, save_name, n, info_holder)
+        cfg.save_callback = lambda sd, n, info: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name})
         pbar = comfy.utils.ProgressBar(steps)
 
         def progress(done, total, loss):
@@ -418,7 +417,6 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
         with torch.inference_mode(False):
             result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress, interrupt_check=_interrupt)
         result.info["save_name"] = save_name
-        info_holder.update(result.info)
         report = _report(result)
         return io.NodeOutput(result.lora_sd, {"loss": result.losses, "info": result.info}, result.steps, report)
 
@@ -465,8 +463,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
             log_every=log_every, tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
-        info_holder = {}
-        cfg.save_callback = lambda sd, n: _save_checkpoint(sd, save_name, n, info_holder)
+        cfg.save_callback = lambda sd, n, info: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name})
         pbar = comfy.utils.ProgressBar(steps)
 
         def progress(done, total, loss):
@@ -475,7 +472,6 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
         with torch.inference_mode(False):
             result = train_planner_lora(clip, dataset, cfg, progress=progress, interrupt_check=_interrupt)
         result.info["save_name"] = save_name
-        info_holder.update(result.info)
         report = _report(result)
         return io.NodeOutput(result.lora_sd, {"loss": result.losses, "info": result.info}, result.steps, report)
 

@@ -248,6 +248,14 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     counts = split_counts(micro_steps, len(replicas))
     seg_frames = int(round(cfg.segment_seconds * FRAMES_PER_SECOND)) if cfg.segment_seconds > 0 else 0
     losses = []
+    info = {"kind": "acoustic", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets,
+            "train_acoustic_head": cfg.train_acoustic_head, "steps": cfg.steps, "items": len(dataset.with_latents()),
+            "chunks": len(samples), "segment_seconds": cfg.segment_seconds, "timestep_sampling": cfg.timestep_sampling,
+            "shift": cfg.shift, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule, "mode": cfg.mode,
+            "caption_dropout": cfg.caption_dropout,
+            "devices": [str(d) for d in devices], "micro_steps": micro_steps,
+            "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids))}
+
     monitor = TrainMonitor("acoustic", cfg.steps, cfg.log_every, cfg.tensorboard_dir or None, cfg.run_name,
                            config={k: v for k, v in vars(cfg).items() if k not in ("existing_lora", "save_callback")})
 
@@ -301,7 +309,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             if progress is not None:
                 progress(step + 1, cfg.steps, step_loss)
             if cfg.save_every and cfg.save_callback and (step + 1) % cfg.save_every == 0 and step + 1 < cfg.steps:
-                cfg.save_callback(primary.lora.export(), step + 1)
+                cfg.save_callback(primary.lora.export(), step + 1,
+                                  {**info, "steps": step + 1, "partial": True, "loss": step_loss})
     finally:
         comfy.model_management.in_training = False
         monitor.close()
@@ -318,14 +327,7 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     exported = primary.lora.export()
     for adapter in primary.lora.adapters:
         adapter.requires_grad_(False)
-    info = {"kind": "acoustic", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets,
-            "train_acoustic_head": cfg.train_acoustic_head, "steps": cfg.steps, "items": len(dataset.with_latents()),
-            "chunks": len(samples), "segment_seconds": cfg.segment_seconds, "timestep_sampling": cfg.timestep_sampling,
-            "shift": cfg.shift, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule, "mode": cfg.mode,
-            "caption_dropout": cfg.caption_dropout,
-            "devices": [str(d) for d in devices], "micro_steps": micro_steps,
-            "tensorboard": str(monitor.log_dir) if monitor.log_dir else None,
-            "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids))}
+    info["tensorboard"] = str(monitor.log_dir) if monitor.log_dir else None
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,
                        seconds=time.perf_counter() - start_time, info=info)
 

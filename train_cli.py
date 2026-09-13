@@ -217,14 +217,14 @@ def main(argv=None):
     def progress(done, total, loss):
         pass  # the trainer's TrainMonitor prints step/loss lines
 
-    def save_partial(sd, n):
+    def save_partial(sd, n, info):
         from yue2_trainer.lora import save_lora_file
         path = Path(args.out).with_suffix("")
         target = Path(f"{path}_{n:06d}.safetensors")
         if not target.is_absolute() and target.parent == Path("."):
             import folder_paths
             target = Path(folder_paths.get_folder_paths("loras")[0]) / target
-        save_lora_file(sd, target, {"partial": True, "steps": n})
+        save_lora_file(sd, target, info)
         logging.info("saved intermediate LoRA %s", target)
 
     with torch.inference_mode(False):
