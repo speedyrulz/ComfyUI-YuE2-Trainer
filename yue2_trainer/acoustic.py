@@ -34,6 +34,7 @@ class AcousticConfig:
     segment_seconds: float = 30.0       # random crop length (0 = whole song / chunk)
     mode: str = "full"                  # full|melody|off|auto  (CoT instruction used for the prefix)
     use_semantic_tokens: bool = False   # condition on semantic tokens for items that carry them
+    caption_dropout: float = 0.1        # probability of training a step on the unconditional (instruction-only) prefix
     timestep_sampling: str = "uniform"  # uniform | logit_normal
     shift: float = 1.0                  # sigma = shift*u / (1 + (shift-1)*u)
     logit_mean: float = 0.0
@@ -123,6 +124,7 @@ class _Sample:
     item: Item
     prefix: PrefixCache
     chunk: tuple[int, int]
+    uncond: Optional[PrefixCache] = None   # instruction-only prefix for caption dropout
 
 
 def prepare_samples(clip, dataset: Dataset, cfg: AcousticConfig, progress=None) -> list[_Sample]:
@@ -148,10 +150,18 @@ def prepare_samples(clip, dataset: Dataset, cfg: AcousticConfig, progress=None) 
                     continue
                 prefix = build_acoustic_prefix(clip, item.style, item.lyrics, abc, cot, semantic=semantic[:n],
                                                chunk=chunk, device=device)
-                samples.append(_Sample(item, prefix, chunk))
+                uncond = None
+                if cfg.caption_dropout > 0:
+                    uncond = build_acoustic_prefix(clip, item.style, item.lyrics, abc, cot, semantic=semantic[:n],
+                                                   chunk=chunk, device=device, unconditional=True)
+                samples.append(_Sample(item, prefix, chunk, uncond))
         else:
             prefix = build_acoustic_prefix(clip, item.style, item.lyrics, abc, cot, total_frames=item.frames, device=device)
-            samples.append(_Sample(item, prefix, (0, item.frames)))
+            uncond = None
+            if cfg.caption_dropout > 0:
+                uncond = build_acoustic_prefix(clip, item.style, item.lyrics, abc, cot, total_frames=item.frames,
+                                               device=device, unconditional=True)
+            samples.append(_Sample(item, prefix, (0, item.frames), uncond))
         if progress is not None:
             progress(index + 1, len(items))
     return samples
@@ -172,7 +182,20 @@ def _load_patchers(model_patcher, devices: list[torch.device]):
     for mp in patchers:
         comfy.model_management.load_models_gpu([mp], memory_required=1e20, force_full_load=True)
         mp.model.diffusion_model.requires_grad_(False)
+        _check_trainable_weights(mp.model.diffusion_model)
     return patchers
+
+
+def _check_trainable_weights(module):
+    """Refuse quantized checkpoints (e.g. yue2_3b_int8_convrot): their weights cannot back-propagate."""
+    weight = next(iter(p for n, p in module.named_parameters() if n.endswith("qkv_proj.weight")), None)
+    if weight is None:
+        return
+    dtype = weight.dtype
+    quantized = type(weight).__name__ != "Parameter" or dtype not in (torch.bfloat16, torch.float16, torch.float32)
+    if quantized:
+        raise ValueError(f"The loaded YuE2 checkpoint has quantized weights ({type(weight).__name__}, {dtype}); "
+                         "training needs the bf16 checkpoint (yue2_3b_bf16.safetensors).")
 
 
 def _setup_replicas(patchers, devices: list[torch.device], cfg: AcousticConfig, lora_dtype) -> list[Replica]:
@@ -247,9 +270,12 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             sigma = torch.tensor([_sample_sigma(cfg, rng)], device=device)
             x_t = (1.0 - sigma.view(-1, 1, 1)) * x0 + sigma.view(-1, 1, 1) * noise
             target = noise - x0
-            prefix_kv = sample.prefix.kv.to(device, non_blocking=True).clone()
+            prefix = sample.prefix
+            if sample.uncond is not None and py_rng.random() < cfg.caption_dropout:
+                prefix = sample.uncond
+            prefix_kv = prefix.kv.to(device, non_blocking=True).clone()
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                pred = nar_forward(dm, x_t.to(torch.bfloat16), sigma, prefix_kv, sample.prefix.ar_length,
+                pred = nar_forward(dm, x_t.to(torch.bfloat16), sigma, prefix_kv, prefix.ar_length,
                                    frame_offset=offset, checkpointing=cfg.gradient_checkpointing)
             loss = torch.nn.functional.mse_loss(pred.float(), target)
             (loss / micro_steps).backward()
@@ -296,6 +322,7 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             "train_acoustic_head": cfg.train_acoustic_head, "steps": cfg.steps, "items": len(dataset.with_latents()),
             "chunks": len(samples), "segment_seconds": cfg.segment_seconds, "timestep_sampling": cfg.timestep_sampling,
             "shift": cfg.shift, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule, "mode": cfg.mode,
+            "caption_dropout": cfg.caption_dropout,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
             "tensorboard": str(monitor.log_dir) if monitor.log_dir else None,
             "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids))}

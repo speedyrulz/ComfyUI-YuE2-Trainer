@@ -69,7 +69,7 @@ def encode_dataset(dataset, vae, args, audio_encoder=None):
     from yue2_trainer.dataset import cache_key, load_cache, save_cache
     cache = Path(args.cache_dir).resolve()
     for item in dataset.items:
-        tag = f"v1|max={args.max_seconds}|win={args.window_seconds}"
+        tag = f"v2|max={args.max_seconds}|win={args.window_seconds}|{args.vae_precision}"
         key = cache_key(item, tag)
         cached = load_cache(cache, key) if not args.force_reencode else None
         waveform = None
@@ -80,7 +80,8 @@ def encode_dataset(dataset, vae, args, audio_encoder=None):
                 wave, sr = load_audio(item.audio_path)
                 waveform = crop_audio(to_stereo_48k(wave, sr), args.max_seconds)
                 t0 = time.perf_counter()
-                item.latents = encode_latents(vae, waveform, window_seconds=args.window_seconds).to(torch.float16)
+                item.latents = encode_latents(vae, waveform, window_seconds=args.window_seconds,
+                                              precision=args.vae_precision).to(torch.float16)
                 logging.info("encoded %s: %d frames in %.1fs", item.id, item.latents.shape[-1], time.perf_counter() - t0)
                 cached = {"latents": item.latents, **({k: v for k, v in (cached or {}).items() if k != "latents"})}
                 save_cache(cache, key, cached)
@@ -140,6 +141,7 @@ def add_common(p):
     p.add_argument("--cache-dir", default=str(HERE / "cache"))
     p.add_argument("--max-seconds", type=float, default=0.0)
     p.add_argument("--window-seconds", type=int, default=60)
+    p.add_argument("--vae-precision", default="fp32", choices=["fp32", "fp16"])
     p.add_argument("--force-reencode", action="store_true")
     p.add_argument("--transcribe", choices=["none", "melody", "full"], default="none")
     p.add_argument("--sheetsage", default="sheetsage2_bf16.safetensors")
@@ -177,6 +179,8 @@ def main(argv=None):
     pa.add_argument("--prefix-mode", default="full", choices=["full", "melody", "off", "auto"])
     pa.add_argument("--use-semantic", action="store_true", help="Condition on semantic tokens for items that carry them.")
     pa.add_argument("--train-acoustic-head", action="store_true")
+    pa.add_argument("--caption-dropout", type=float, default=0.1,
+                    help="Fraction of steps trained on the unconditional (instruction-only) prefix.")
     pa.add_argument("--timestep-sampling", default="uniform", choices=["uniform", "logit_normal"])
     pa.add_argument("--shift", type=float, default=1.0)
     pp = sub.add_parser("planner", help="Train the planner / semantic (CLIP) LoRA")
@@ -230,6 +234,7 @@ def main(argv=None):
                                  learning_rate=args.lr, lr_schedule=args.lr_schedule, rank=args.rank, alpha=args.alpha, targets=args.targets,
                                  train_acoustic_head=args.train_acoustic_head, segment_seconds=args.segment_seconds,
                                  mode=args.prefix_mode, use_semantic_tokens=args.use_semantic,
+                                 caption_dropout=args.caption_dropout,
                                  timestep_sampling=args.timestep_sampling, shift=args.shift, warmup_steps=args.warmup,
                                  seed=args.seed, lora_dtype=args.lora_dtype,
                                  gradient_checkpointing=not args.no_checkpointing, optimizer=args.optimizer,

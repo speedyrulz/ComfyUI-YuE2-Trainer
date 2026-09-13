@@ -228,6 +228,9 @@ class YuE2TrainerEncodeDataset(io.ComfyNode):
                                tooltip="Truncate each song to this many seconds (0 = whole song)."),
                 io.Int.Input("window_seconds", default=60, min=10, max=600,
                              tooltip="Encoding window; larger is faster but needs more VRAM."),
+                io.Combo.Input("vae_precision", options=["fp32", "fp16"], default="fp32",
+                               tooltip="VAE compute precision for the training latents. fp32 matches the reference "
+                                       "pipeline; fp16 (ComfyUI's generation default) deviates by ~2%."),
                 io.String.Input("cache_dir", default="yue2_trainer_cache",
                                 tooltip="Latent cache folder (relative paths live in ComfyUI/output)."),
                 io.Boolean.Input("force_reencode", default=False),
@@ -236,7 +239,8 @@ class YuE2TrainerEncodeDataset(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, dataset, vae, transcribe, max_seconds, window_seconds, cache_dir, force_reencode, audio_encoder=None):
+    def execute(cls, dataset, vae, transcribe, max_seconds, window_seconds, vae_precision, cache_dir, force_reencode,
+                audio_encoder=None):
         cache = Path(cache_dir)
         if not cache.is_absolute():
             cache = Path(folder_paths.get_output_directory()) / cache
@@ -245,7 +249,7 @@ class YuE2TrainerEncodeDataset(io.ComfyNode):
         for index, src in enumerate(dataset.items):
             _interrupt()
             item = Item(**{k: v for k, v in src.__dict__.items()})
-            tag = f"v1|max={max_seconds}|win={window_seconds}"
+            tag = f"v2|max={max_seconds}|win={window_seconds}|{vae_precision}"
             key = cache_key(item, tag)
             cached = None if force_reencode else load_cache(cache, key)
             need_abc = transcribe != "none" and not (item.abc and item.abc.strip()) and audio_encoder is not None
@@ -259,7 +263,8 @@ class YuE2TrainerEncodeDataset(io.ComfyNode):
                     else:
                         wave, sr = item.extra["waveform"], item.extra["sample_rate"]
                     waveform = crop_audio(to_stereo_48k(wave, sr), max_seconds)
-                    item.latents = encode_latents(vae, waveform, window_seconds=window_seconds).to(torch.float16)
+                    item.latents = encode_latents(vae, waveform, window_seconds=window_seconds,
+                                                  precision=vae_precision).to(torch.float16)
                     payload = {"latents": item.latents}
                     if cached and "abc" in cached:
                         payload["abc"] = cached["abc"]
@@ -375,6 +380,9 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
                                          "folders do); otherwise text-only conditioning is used."),
                 io.Boolean.Input("train_acoustic_head", default=False,
                                  tooltip="Also adapt vae2llm / llm2vae / time embedder projections."),
+                io.Float.Input("caption_dropout", default=0.1, min=0.0, max=0.9, step=0.05,
+                               tooltip="Fraction of steps trained on YuE2's unconditional prefix (instruction only, "
+                                       "no style/lyrics). Keeps the base behaviour reachable and regularises small datasets."),
                 io.Combo.Input("timestep_sampling", options=["uniform", "logit_normal"], default="uniform", advanced=True),
                 io.Float.Input("shift", default=1.0, min=0.1, max=10.0, step=0.1, advanced=True,
                                tooltip="Sigma shift applied to sampled timesteps (1 = none)."),
@@ -386,7 +394,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, clip, dataset, segment_seconds, prefix_mode, use_semantic_tokens, train_acoustic_head,
-                timestep_sampling, shift, steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
+                caption_dropout, timestep_sampling, shift, steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
                 existing_lora, save_every, save_name, log_every, tensorboard, tensorboard_dir):
         cfg = AcousticConfig(
@@ -394,6 +402,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             lr_schedule=lr_schedule,
             rank=rank, alpha=alpha, targets=targets, train_acoustic_head=train_acoustic_head,
             segment_seconds=segment_seconds, mode=prefix_mode, use_semantic_tokens=use_semantic_tokens,
+            caption_dropout=caption_dropout,
             timestep_sampling=timestep_sampling, shift=shift, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,

@@ -29,7 +29,8 @@
    "max_seconds": 0.0,
    "window_seconds": 60,
    "cache_dir": "yue2_trainer_cache",
-   "force_reencode": false
+   "force_reencode": false,
+   "vae_precision": "fp32"
   }
  },
  "4": {
@@ -73,7 +74,8 @@
    "log_every": 1,
    "tensorboard": false,
    "tensorboard_dir": "yue2_tensorboard",
-   "lr_schedule": "cosine"
+   "lr_schedule": "cosine",
+   "caption_dropout": 0.1
   }
  },
  "5": {

@@ -84,7 +84,7 @@ C:/ai/ComfyUI/venv/Scripts/python.exe prepare_dataset.py D:/songs --sections cla
 | **YuE2 Prepare Dataset** | Generate missing `.style.txt` / `.lyrics.txt` sidecars (LRCLIB + Whisper, CLAP tags) and output the scanned dataset. |
 | **YuE2 Dataset From Audio** | One-item dataset from a `LoadAudio` output plus style / lyrics / ABC (chain with `append_to`). |
 | **YuE2 Merge Datasets** | Concatenate two datasets. |
-| **YuE2 Encode Dataset** | VAE-encode every item to latents (cached under `output/yue2_trainer_cache`), optionally transcribe missing ABC with a SheetSage2 `AUDIO_ENCODER`. |
+| **YuE2 Encode Dataset** | VAE-encode every item to latents in fp32 (cached under `output/yue2_trainer_cache`), optionally transcribe missing ABC with a SheetSage2 `AUDIO_ENCODER`. |
 | **YuE2 Train Acoustic LoRA (MODEL)** | Flow-matching LoRA training of the acoustic model. Outputs `LORA_MODEL`, `LOSS_MAP`, steps, a text report. |
 | **YuE2 Train Planner LoRA (CLIP)** | Next-token LoRA training of the language model on ABC (and semantic tokens when present). |
 | **YuE2 Save LoRA** | Writes the LoRA to `models/loras/<name>.safetensors` with training metadata; with `name` blank and `loss_map` connected it uses the trainer's `save_name`. The core `SaveLoRA` node also works (it writes to `output/`). |
@@ -120,6 +120,9 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   like inference (prefix + codec tokens). Otherwise items use the model's codec-dropout ("text-only") conditioning: only the
   text/ABC prefix is visible, and the NAR tokens keep the positions they would have after the codec tokens.
 - `train_acoustic_head` (off): also adapt `vae2llm` / `llm2vae` / time embedder projections.
+- `caption_dropout` (0.1): fraction of steps trained on YuE2's own unconditional prefix (the instruction with
+  no style or lyrics, the same prefix its CFG negative branch uses). Keeps the base behaviour reachable at
+  generation time and regularises small datasets; 0 disables it.
 - `timestep_sampling` / `shift`: sigma distribution (uniform by default, matching the reference solver).
 - `rank`/`alpha` (16/16 → scale 1), `learning_rate` (1e-4), `lr_schedule` = `cosine` (decay to 10%), `constant`,
   or `linear`; `warmup_steps` ramps up first in every mode. Same options on the planner node.

@@ -185,3 +185,8 @@ def test_lr_schedules():
     assert abs(_lr_at(100, 100, 10, base, "cosine") - 0.1 * base) < 1e-12
     assert abs(_lr_at(100, 100, 10, base, "linear") - 0.1 * base) < 1e-12
     assert abs(_lr_at(55, 100, 10, base, "linear") - 0.55 * base) < 1e-12
+
+
+def test_lr_schedule_names_exported():
+    from yue2_trainer.acoustic import LR_SCHEDULES, AcousticConfig
+    assert AcousticConfig().caption_dropout == 0.1 and "constant" in LR_SCHEDULES

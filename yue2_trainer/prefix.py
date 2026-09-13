@@ -38,6 +38,18 @@ def music_prefix_ids(clip, style: str, lyrics: str, abc: Optional[str], cot: str
     return base + [ABC_START] + abc_ids + [ABC_END, MUSIC_START], abc_ids
 
 
+def negative_prefix_ids(clip, abc_ids: list[int], cot: str) -> list[int]:
+    """YuE2's own CFG negative prefix: instruction only (no style, no lyrics), keeping the exact ABC ids.
+
+    Matches ``protocol.negative_prefix`` / the ComfyUI text encoder's ``negative`` branch. Used for
+    caption dropout so the LoRA also learns from an unconditioned context.
+    """
+    base = [EOD] + encode_text(clip, INSTRUCTIONS[cot])
+    if cot == "off":
+        return base + [MUSIC_START]
+    return base + [ABC_START] + list(abc_ids) + [ABC_END, MUSIC_START]
+
+
 def abc_sequence(clip, style: str, lyrics: str, abc: str, cot: str) -> tuple[list[int], int]:
     """Planner target: prefix + ABC_START, then ABC tokens + ABC_END. Returns (ids, loss_start)."""
     base = prompt_ids(clip, style, lyrics, cot) + [ABC_START]
@@ -90,7 +102,7 @@ def compute_prefix_kv(clip, ids: list[int], device=None) -> torch.Tensor:
 
 def build_acoustic_prefix(clip, style: str, lyrics: str, abc: Optional[str], cot: str,
                           semantic: Optional[list[int]] = None, chunk: Optional[tuple[int, int]] = None,
-                          total_frames: Optional[int] = None, device=None) -> PrefixCache:
+                          total_frames: Optional[int] = None, device=None, unconditional: bool = False) -> PrefixCache:
     """Cache the AR prefix for the acoustic model.
 
     Without semantic tokens the model is conditioned in its codec-dropout ("text-only") mode:
@@ -98,7 +110,9 @@ def build_acoustic_prefix(clip, style: str, lyrics: str, abc: Optional[str], cot
     have after ``total_frames`` codec tokens, exactly as the reference implementation masks them.
     With semantic tokens the prefix is the full inference prefix for ``chunk`` = (start, end).
     """
-    prefix, _ = music_prefix_ids(clip, style, lyrics, abc, cot)
+    prefix, abc_ids = music_prefix_ids(clip, style, lyrics, abc, cot)
+    if unconditional:
+        prefix = negative_prefix_ids(clip, abc_ids, cot)
     if semantic is not None:
         start, end = chunk if chunk is not None else (0, len(semantic))
         ids = prefix + [int(t) + CODEC_OFFSET for t in semantic[start:end]] + [MUSIC_END]
@@ -114,4 +128,4 @@ def build_acoustic_prefix(clip, style: str, lyrics: str, abc: Optional[str], cot
 
 
 __all__ = ["encode_text", "prompt_ids", "music_prefix_ids", "abc_sequence", "resolve_mode", "PrefixCache",
-           "compute_prefix_kv", "build_acoustic_prefix", "load_clip_for_prefill"]
+           "compute_prefix_kv", "build_acoustic_prefix", "load_clip_for_prefill", "negative_prefix_ids"]

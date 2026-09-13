@@ -66,15 +66,43 @@ def frames_for_samples(samples: int) -> int:
     return samples // SAMPLES_PER_FRAME
 
 
+class _vae_precision:
+    """Temporarily run a ComfyUI VAE in the requested dtype (fp32 matches the reference pipeline)."""
+
+    def __init__(self, vae, precision: str):
+        self.vae = vae
+        self.dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(precision)
+        self.saved = None
+
+    def __enter__(self):
+        if self.dtype is not None and getattr(self.vae, "vae_dtype", None) not in (None, self.dtype):
+            self.saved = (self.vae.vae_dtype, next(self.vae.first_stage_model.parameters()).dtype)
+            self.vae.first_stage_model.to(self.dtype)
+            self.vae.vae_dtype = self.dtype
+        return self
+
+    def __exit__(self, *exc):
+        if self.saved is not None:
+            self.vae.vae_dtype = self.saved[0]
+            self.vae.first_stage_model.to(self.saved[1])
+
+
 @torch.no_grad()
 def encode_latents(vae, wave: torch.Tensor, window_seconds: float = 60.0, halo_frames: int = 32,
-                   progress=None) -> torch.Tensor:
+                   progress=None, precision: str = "fp32") -> torch.Tensor:
     """Encode a 48 kHz stereo waveform [2, N] into YuE2 latents [64, T] (float32, CPU).
 
     The song is encoded in overlapping windows so that arbitrarily long audio fits in
     memory; each window keeps a halo on both sides which is cropped away, so the result
     is (up to boundary effects far smaller than a frame) identical to one-shot encoding.
+    ``precision`` selects the VAE compute dtype; fp32 (default) matches the reference
+    pipeline, fp16 (ComfyUI's default for this VAE) deviates by ~2% and is only faster.
     """
+    with _vae_precision(vae, precision):
+        return _encode_latents(vae, wave, window_seconds, halo_frames, progress)
+
+
+def _encode_latents(vae, wave, window_seconds, halo_frames, progress):
     total_frames = frames_for_samples(wave.shape[-1])
     if total_frames < 1:
         raise ValueError("Audio shorter than one latent frame (40 ms)")

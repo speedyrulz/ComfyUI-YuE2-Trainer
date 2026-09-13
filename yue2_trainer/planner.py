@@ -9,7 +9,7 @@ from typing import Callable, Optional
 
 import torch
 
-from .acoustic import TrainResult, _make_optimizer, _lr_at
+from .acoustic import TrainResult, _check_trainable_weights, _make_optimizer, _lr_at
 from .constants import CLIP_KEY_PREFIX, CODEC_OFFSET, CONTEXT, MUSIC_END
 from .dataset import Dataset, Item
 from .forward import ar_hidden, chunked_cross_entropy
@@ -101,6 +101,7 @@ def _load_clips(clip, devices: list[torch.device]):
         comfy.model_management.load_models_gpu([work.patcher], force_full_load=True)
         work.cond_stage_model.set_clip_options({"execution_device": device})
         work.cond_stage_model.model.requires_grad_(False)
+        _check_trainable_weights(work.cond_stage_model.model)
     return clips
 
 
