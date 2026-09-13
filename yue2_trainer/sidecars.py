@@ -236,7 +236,6 @@ class WhisperTranscriber:
                 out.append((offset, offset + chunk_seconds, plain))
         return out
 
-    @torch.no_grad()
     @staticmethod
     def _split_sentences(segments: list[tuple[float, float, str]]) -> list[tuple[float, float, str]]:
         """large-v3 often packs several sung lines into one segment; split on sentence punctuation."""
@@ -251,6 +250,7 @@ class WhisperTranscriber:
                 out.append((start + i * step, start + (i + 1) * step, part.rstrip(".。")))
         return out
 
+    @torch.no_grad()
     def transcribe(self, wave16k: np.ndarray, language: Optional[str] = None,
                    batch_size: int = 8) -> list[tuple[float, float, str]]:
         pieces = [wave16k[i:i + self.CHUNK] for i in range(0, len(wave16k), self.CHUNK)]
@@ -561,7 +561,7 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
     if not files:
         raise ValueError(f"No audio files in {folder}")
     device = _resolve_device(cfg.device)
-    need_whisper = cfg.lyrics_source in ("lrclib+whisper", "whisper") or cfg.style_source == "clap"
+    need_whisper = cfg.lyrics_source in ("lrclib+whisper", "whisper")  # language detection rides on Whisper
     whisper = tagger = separator = None
     reports = []
     try:
@@ -628,7 +628,7 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
                         report.lyrics_source = "lrclib"
                 elif found is None:
                     report.notes.append(f"LRCLIB: nothing found for '{meta['artist'] or '?'} - {meta['title']}'")
-            if (want_lyrics and lyrics is None and use_whisper) or (want_style and need_whisper and cfg.lyrics_source != "none"):
+            if use_whisper and ((want_lyrics and lyrics is None) or (want_style and language is None)):
                 if whisper is None:
                     whisper = WhisperTranscriber(cfg.whisper_model, device)
                 audio16 = whisper_audio()
