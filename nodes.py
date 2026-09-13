@@ -324,8 +324,9 @@ def _common_training_inputs(default_lr, default_steps):
                        tooltip="Continue training from a LoRA file in models/loras."),
         io.Int.Input("save_every", default=0, min=0, max=100000, advanced=True,
                      tooltip="Write an intermediate LoRA to models/loras every N steps (0 = off)."),
-        io.String.Input("save_name", default="yue2_lora", advanced=True,
-                        tooltip="Base name for intermediate saves and the TensorBoard run."),
+        io.String.Input("save_name", default="yue2_lora",
+                        tooltip="Name of the LoRA: used by YuE2 Save LoRA (when its name is blank), for intermediate "
+                                "saves and for the TensorBoard run."),
         io.Int.Input("log_every", default=1, min=1, max=10000,
                      tooltip="Print step / loss / lr / grad-norm / ETA to the console every N steps."),
         io.Boolean.Input("tensorboard", default=False,
@@ -390,6 +391,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
 
         with torch.inference_mode(False):
             result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress, interrupt_check=_interrupt)
+        result.info["save_name"] = save_name
         info_holder.update(result.info)
         report = _report(result)
         return io.NodeOutput(result.lora_sd, {"loss": result.losses, "info": result.info}, result.steps, report)
@@ -445,6 +447,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
 
         with torch.inference_mode(False):
             result = train_planner_lora(clip, dataset, cfg, progress=progress, interrupt_check=_interrupt)
+        result.info["save_name"] = save_name
         info_holder.update(result.info)
         report = _report(result)
         return io.NodeOutput(result.lora_sd, {"loss": result.losses, "info": result.info}, result.steps, report)
@@ -473,15 +476,18 @@ class YuE2TrainerSaveLoRA(io.ComfyNode):
             is_output_node=True,
             inputs=[
                 LORA_MODEL.Input("lora"),
-                io.String.Input("name", default="yue2_lora"),
+                io.String.Input("name", default="",
+                                tooltip="File name. Leave blank to use the trainer's save_name (connect loss_map)."),
                 io.Boolean.Input("add_timestamp", default=True),
-                LOSS_MAP.Input("loss_map", optional=True),
+                LOSS_MAP.Input("loss_map", optional=True, tooltip="Connect the trainer's loss_map: supplies save_name and metadata."),
             ],
             outputs=[io.String.Output("path", display_name="path")],
         )
 
     @classmethod
     def execute(cls, lora, name, add_timestamp, loss_map=None):
+        if not name.strip() and loss_map:
+            name = str((loss_map.get("info") or {}).get("save_name") or "")
         name = "".join(c for c in name.strip() if c not in '\\/:*?"<>|') or "yue2_lora"
         if add_timestamp:
             name = f"{name}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
