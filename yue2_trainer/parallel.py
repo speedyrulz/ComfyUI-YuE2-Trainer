@@ -65,6 +65,26 @@ def resolve_devices(spec: str) -> list[torch.device]:
     return out
 
 
+def clone_patcher_for_device(patcher, device: torch.device, fresh: bool):
+    """A ModelPatcher for ``device``.
+
+    ``fresh`` asks for an independent copy of the weights (extra data-parallel replicas).
+    ComfyUI's ``deepclone_multigpu`` is used when the loader registered a factory: it produces
+    a pristine patcher whose per-device bookkeeping (dynamic VRAM pins) is set up for the
+    target GPU. Otherwise the load device is retargeted by hand and registered.
+    """
+    same = torch.device(patcher.load_device) == device
+    if same and not fresh:
+        return patcher.clone()
+    if hasattr(patcher, "deepclone_multigpu") and getattr(patcher, "cached_patcher_init", None) is not None:
+        return patcher.deepclone_multigpu(new_load_device=device)
+    clone = patcher.clone(force_deepcopy=fresh)
+    clone.load_device = device
+    if hasattr(clone, "register_load_device"):
+        clone.register_load_device(device)
+    return clone
+
+
 @dataclass
 class Replica:
     index: int
@@ -147,5 +167,5 @@ def free_replicas(replicas: list[Replica]):
                 torch.cuda.empty_cache()
 
 
-__all__ = ["available_cuda_devices", "device_choices", "resolve_devices", "Replica",
+__all__ = ["available_cuda_devices", "device_choices", "resolve_devices", "clone_patcher_for_device", "Replica",
            "sync_lora_weights", "reduce_gradients", "split_counts", "run_on_replicas", "free_replicas"]

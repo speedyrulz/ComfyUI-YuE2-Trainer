@@ -15,8 +15,8 @@ from .constants import FRAMES_PER_SECOND, MODEL_KEY_PREFIX, CONTEXT
 from .dataset import Dataset, Item
 from .forward import nar_forward
 from .lora import create_lora, select_target_modules, count_parameters
-from .parallel import (Replica, free_replicas, reduce_gradients, resolve_devices, run_on_replicas,
-                       split_counts, sync_lora_weights)
+from .parallel import (Replica, clone_patcher_for_device, free_replicas, reduce_gradients, resolve_devices,
+                       run_on_replicas, split_counts, sync_lora_weights)
 from .prefix import PrefixCache, build_acoustic_prefix, load_clip_for_prefill, music_prefix_ids, resolve_mode
 
 
@@ -148,10 +148,8 @@ def _load_patchers(model_patcher, devices: list[torch.device]):
     import comfy.model_management
     patchers = []
     for index, device in enumerate(devices):
-        mp = model_patcher.clone(force_deepcopy=index > 0)
+        mp = clone_patcher_for_device(model_patcher, device, fresh=index > 0)
         mp.set_model_compute_dtype(torch.bfloat16)
-        if torch.device(mp.load_device) != device:
-            mp.load_device = device
         patchers.append(mp)
     for mp in patchers:
         comfy.model_management.load_models_gpu([mp], memory_required=1e20, force_full_load=True)

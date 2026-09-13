@@ -14,8 +14,8 @@ from .constants import CLIP_KEY_PREFIX, CODEC_OFFSET, CONTEXT, MUSIC_END
 from .dataset import Dataset, Item
 from .forward import ar_hidden, chunked_cross_entropy
 from .lora import create_lora, select_target_modules, count_parameters
-from .parallel import (Replica, free_replicas, reduce_gradients, resolve_devices, run_on_replicas,
-                       split_counts, sync_lora_weights)
+from .parallel import (Replica, clone_patcher_for_device, free_replicas, reduce_gradients, resolve_devices,
+                       run_on_replicas, split_counts, sync_lora_weights)
 from .prefix import abc_sequence, music_prefix_ids, resolve_mode, load_clip_for_prefill
 
 
@@ -88,12 +88,9 @@ def _load_clips(clip, devices: list[torch.device]):
     clips = []
     for index, device in enumerate(devices):
         work = clip.clone()
-        if index > 0:
-            work.patcher = clip.patcher.clone(force_deepcopy=True)
-            work.cond_stage_model = work.patcher.model
+        work.patcher = clone_patcher_for_device(clip.patcher, device, fresh=index > 0)
+        work.cond_stage_model = work.patcher.model
         work.patcher.set_model_compute_dtype(torch.bfloat16)
-        if torch.device(work.patcher.load_device) != device:
-            work.patcher.load_device = device
         clips.append(work)
     for work, device in zip(clips, devices):
         comfy.model_management.load_models_gpu([work.patcher], force_full_load=True)
