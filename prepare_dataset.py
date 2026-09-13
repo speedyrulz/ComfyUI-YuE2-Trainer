@@ -23,6 +23,8 @@ def main(argv=None):
     p.add_argument("folder")
     p.add_argument("--lyrics", default="lrclib+whisper", choices=["lrclib+whisper", "lrclib", "whisper", "none"])
     p.add_argument("--whisper-model", default=DEFAULT_WHISPER)
+    p.add_argument("--language", default="auto", help="Whisper language code (en, zh, ja, ...) or auto.")
+    p.add_argument("--no-separate", action="store_true", help="Transcribe the full mix instead of the demucs vocal stem.")
     p.add_argument("--style", default="clap", choices=["clap", "none"])
     p.add_argument("--default-style", default="", help="Style text when --style none.")
     p.add_argument("--sections", default="heuristic", choices=["heuristic", "claude", "none"],
@@ -34,6 +36,7 @@ def main(argv=None):
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = SidecarConfig(lyrics_source=args.lyrics, whisper_model=args.whisper_model, style_source=args.style,
+                        language=args.language, separate_vocals=not args.no_separate,
                         default_style=args.default_style, section_tags=args.sections, claude_model=args.claude_model,
                         overwrite=args.overwrite, device=args.device)
 

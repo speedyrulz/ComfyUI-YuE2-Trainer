@@ -10,14 +10,16 @@
   "inputs": {
    "folder": "yue2_dataset",
    "lyrics_source": "lrclib+whisper",
-   "whisper_model": "openai/whisper-large-v3-turbo",
+   "whisper_model": "openai/whisper-large-v3",
    "section_tags": "heuristic",
    "claude_model": "claude-opus-5",
    "style_source": "clap",
    "default_style": "",
    "overwrite": false,
    "device": "auto",
-   "recursive": true
+   "recursive": true,
+   "language": "auto",
+   "separate_vocals": true
   }
  },
  "3": {

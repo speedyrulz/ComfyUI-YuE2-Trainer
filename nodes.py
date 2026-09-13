@@ -105,6 +105,10 @@ class YuE2TrainerPrepareDataset(io.ComfyNode):
                 io.String.Input("folder", default="", tooltip="Absolute path, or a folder name inside ComfyUI/input."),
                 io.Combo.Input("lyrics_source", options=["lrclib+whisper", "lrclib", "whisper", "none"], default="lrclib+whisper"),
                 io.Combo.Input("whisper_model", options=WHISPER_CHOICES, default=WHISPER_CHOICES[0], advanced=True),
+                io.String.Input("language", default="auto",
+                                tooltip="Whisper language code (en, zh, ja, ko, es, ...) or auto."),
+                io.Boolean.Input("separate_vocals", default=True,
+                                 tooltip="Isolate the vocal stem with demucs before transcribing (much more accurate on music)."),
                 io.Combo.Input("section_tags", options=["heuristic", "claude", "none"], default="heuristic",
                                tooltip="How [Verse]/[Chorus] tags are added. 'claude' uses the Anthropic API "
                                        "(ANTHROPIC_API_KEY) and falls back to the heuristic on any failure."),
@@ -120,14 +124,15 @@ class YuE2TrainerPrepareDataset(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, folder, lyrics_source, whisper_model, section_tags, claude_model, style_source, default_style,
-                overwrite, device, recursive):
+    def execute(cls, folder, lyrics_source, whisper_model, language, separate_vocals, section_tags, claude_model,
+                style_source, default_style, overwrite, device, recursive):
         path = Path(folder.strip().strip('"'))
         if not path.is_absolute():
             candidate = Path(folder_paths.get_input_directory()) / path
             if candidate.is_dir():
                 path = candidate
         cfg = SidecarConfig(lyrics_source=lyrics_source, whisper_model=whisper_model, style_source=style_source,
+                            language=language.strip().lower() or "auto", separate_vocals=separate_vocals,
                             section_tags=section_tags, claude_model=claude_model, default_style=default_style,
                             overwrite=overwrite, device="auto" if device == "auto" else device)
         if cfg.device == "auto":

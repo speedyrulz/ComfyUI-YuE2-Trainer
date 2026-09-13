@@ -4,8 +4,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from yue2_trainer.sidecars import (assemble_style, clean_segments, heuristic_sections, parse_stem,  # noqa: E402
-                                   plain_to_sections)
+from yue2_trainer.sidecars import (assemble_style, clean_segments, heuristic_sections,  # noqa: E402
+                                   lyrics_match_transcript, parse_stem, plain_to_sections)
 
 
 def test_parse_stem():
@@ -62,3 +62,23 @@ def test_fuzzy_chorus_detection():
               (30.0, 32.0, "hold on tonight, my love"), (32.0, 34.0, "hold on until the lights")]
     out = heuristic_sections(chunks)
     assert out.count("[Chorus]") == 2
+
+
+def test_lyrics_match_transcript():
+    lyrics = "We've come too far to give up who we are\nSo let's raise the bar and our cups to the stars"
+    good = "we come too far to give up who we are so lets raise the bar"
+    bad = "do you know how lucky i feel to find a man who loves me"
+    assert lyrics_match_transcript(lyrics, good) > 0.6
+    assert lyrics_match_transcript(lyrics, bad) < 0.3
+    assert lyrics_match_transcript("今晚不眠 快乐无限", "今晚不灭快乐无限") > 0.7
+
+
+def test_split_sentences_and_credit_filter():
+    from yue2_trainer.sidecars import WhisperTranscriber
+    out = WhisperTranscriber._split_sentences([(0.0, 6.0, "A breath in the dark. Every word you say cuts like a blade. And more"),
+                                               (6.0, 8.0, "旋转的唱片划破了寂静。气泡在上升")])
+    assert [t for _, _, t in out] == ["A breath in the dark", "Every word you say cuts like a blade", "And more",
+                                      "旋转的唱片划破了寂静", "气泡在上升"]
+    assert out[0][1] == 2.0 and out[2][0] == 4.0
+    kept, dropped = clean_segments([(0.0, 1.0, "编曲 李宗盛"), (1.0, 2.0, "今晚不眠快乐无限")])
+    assert [t for _, _, t in kept] == ["今晚不眠快乐无限"] and dropped == 1

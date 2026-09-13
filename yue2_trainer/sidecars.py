@@ -27,10 +27,10 @@ from .constants import AUDIO_EXTENSIONS
 
 LOG = logging.getLogger("yue2_trainer.sidecars")
 
-DEFAULT_WHISPER = "openai/whisper-large-v3-turbo"
+DEFAULT_WHISPER = "openai/whisper-large-v3"
 DEFAULT_CLAP = "laion/larger_clap_music_and_speech"
 DEFAULT_CLAUDE = "claude-opus-5"
-WHISPER_CHOICES = [DEFAULT_WHISPER, "openai/whisper-large-v3", "openai/whisper-medium", "openai/whisper-small"]
+WHISPER_CHOICES = [DEFAULT_WHISPER, "openai/whisper-large-v3-turbo", "openai/whisper-medium", "openai/whisper-small"]
 
 GENRES = ["pop", "rock", "hip hop", "rap", "r&b", "soul", "funk", "jazz", "blues", "country", "folk", "metal",
           "punk", "indie rock", "electronic", "house", "techno", "trance", "drum and bass", "dubstep", "ambient",
@@ -60,6 +60,8 @@ MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 
 class SidecarConfig:
     lyrics_source: str = "lrclib+whisper"   # lrclib+whisper | lrclib | whisper | none
     whisper_model: str = DEFAULT_WHISPER
+    language: str = "auto"                  # auto or a Whisper language code (en, zh, ja, ...)
+    separate_vocals: bool = True            # run demucs and transcribe the vocal stem (much more accurate)
     style_source: str = "clap"              # clap | none
     clap_model: str = DEFAULT_CLAP
     section_tags: str = "heuristic"         # heuristic | claude | none
@@ -121,21 +123,30 @@ def parse_stem(stem: str) -> tuple[Optional[str], str]:
 
 # ── lyrics: LRCLIB ─────────────────────────────────────────────────────────────
 
-def fetch_lrclib(artist: Optional[str], title: str, duration: Optional[float], timeout: float = 15.0) -> Optional[str]:
+def fetch_lrclib(artist: Optional[str], title: str, duration: Optional[float], timeout: float = 15.0,
+                 tolerance: float = 3.0) -> Optional[dict]:
+    """Return {"lyrics", "artist", "title", "duration"} or None.
+
+    Exact artist+title+duration first; otherwise a search whose best hit must be within
+    ``tolerance`` seconds of the file's duration (title-only searches are ambiguous, so they
+    are only accepted with a duration match). The caller may additionally verify the text
+    against a Whisper transcript.
+    """
     import requests
     headers = {"User-Agent": "ComfyUI-YuE2-Trainer/0.1 (https://github.com/speedyrulz/ComfyUI-YuE2-Trainer)"}
+
+    def pack(c):
+        return {"lyrics": c["plainLyrics"].strip(), "artist": c.get("artistName"), "title": c.get("trackName"),
+                "duration": c.get("duration")}
     try:
         if artist and duration:
             r = requests.get("https://lrclib.net/api/get", timeout=timeout, headers=headers,
                              params={"artist_name": artist, "track_name": title, "duration": int(round(duration))})
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("plainLyrics"):
-                    return data["plainLyrics"].strip()
-        if not artist:
-            # title-only search is too ambiguous ("Passion" matches many songs); leave it to Whisper
-            return None
-        params = {"track_name": title, "artist_name": artist}
+            if r.status_code == 200 and r.json().get("plainLyrics"):
+                return pack(r.json())
+        params = {"track_name": title}
+        if artist:
+            params["artist_name"] = artist
         r = requests.get("https://lrclib.net/api/search", timeout=timeout, headers=headers, params=params)
         if r.status_code != 200:
             return None
@@ -144,12 +155,27 @@ def fetch_lrclib(artist: Optional[str], title: str, duration: Optional[float], t
             return None
         if duration:
             candidates.sort(key=lambda c: abs(float(c.get("duration") or 0) - duration))
-            if abs(float(candidates[0].get("duration") or 0) - duration) > 15:
-                return None
-        return candidates[0]["plainLyrics"].strip()
+            best = candidates[0]
+            if abs(float(best.get("duration") or 0) - duration) <= tolerance:
+                return pack(best)
+            return None
+        return pack(candidates[0]) if artist else None
     except Exception as exc:  # noqa: BLE001
         LOG.warning("LRCLIB lookup failed for %s - %s: %s", artist, title, exc)
         return None
+
+
+def lyrics_match_transcript(lyrics: str, transcript: str) -> float:
+    """Fraction of distinct transcript words (or CJK characters) that occur in the lyrics."""
+    def tokens(text):
+        text = text.lower()
+        words = set(re.findall(r"[a-z0-9']{3,}", text))
+        cjk = set(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", text))
+        return words | cjk
+    have, want = tokens(lyrics), tokens(transcript)
+    if not want:
+        return 0.0
+    return len(want & have) / len(want)
 
 
 # ── lyrics: Whisper ────────────────────────────────────────────────────────────
@@ -178,15 +204,18 @@ class WhisperTranscriber:
         return feats.to(self.device, self.dtype)
 
     @torch.no_grad()
-    def detect_language(self, wave16k: np.ndarray) -> Optional[str]:
+    def detect_language(self, wave16k: np.ndarray, windows: int = 3) -> Optional[str]:
+        """Majority vote over the loudest windows so instrumental passages do not decide the language."""
         try:
-            # use the loudest 30 s window so instrumental intros do not confuse detection
-            best = max(range(0, max(1, len(wave16k) - self.CHUNK + 1), self.CHUNK // 2),
-                       key=lambda i: float(np.abs(wave16k[i:i + self.CHUNK]).mean()))
-            ids = self.model.detect_language(self._features([wave16k[best:best + self.CHUNK]]))
-            token = self.processor.tokenizer.decode(ids.reshape(-1)[:1])
-            code = token.strip("<|>")
-            return code if code and code != "nospeech" else None
+            starts = list(range(0, max(1, len(wave16k) - self.CHUNK + 1), self.CHUNK // 2)) or [0]
+            starts.sort(key=lambda i: -float(np.abs(wave16k[i:i + self.CHUNK]).mean()))
+            votes: dict[str, int] = {}
+            for i in starts[:windows]:
+                ids = self.model.detect_language(self._features([wave16k[i:i + self.CHUNK]]))
+                code = self.processor.tokenizer.decode(ids.reshape(-1)[:1]).strip("<|>")
+                if code and code != "nospeech":
+                    votes[code] = votes.get(code, 0) + 1
+            return max(votes, key=votes.get) if votes else None
         except Exception as exc:  # noqa: BLE001
             LOG.debug("language detection failed: %s", exc)
             return None
@@ -208,6 +237,20 @@ class WhisperTranscriber:
         return out
 
     @torch.no_grad()
+    @staticmethod
+    def _split_sentences(segments: list[tuple[float, float, str]]) -> list[tuple[float, float, str]]:
+        """large-v3 often packs several sung lines into one segment; split on sentence punctuation."""
+        out = []
+        for start, end, text in segments:
+            parts = [p.strip(" ,;") for p in re.split(r"(?<=[.!?。！？])\s+|(?<=[。！？])", text) if p.strip(" ,;")]
+            if len(parts) <= 1:
+                out.append((start, end, text.strip().rstrip(".。")))
+                continue
+            step = (end - start) / len(parts)
+            for i, part in enumerate(parts):
+                out.append((start + i * step, start + (i + 1) * step, part.rstrip(".。")))
+        return out
+
     def transcribe(self, wave16k: np.ndarray, language: Optional[str] = None,
                    batch_size: int = 8) -> list[tuple[float, float, str]]:
         pieces = [wave16k[i:i + self.CHUNK] for i in range(0, len(wave16k), self.CHUNK)]
@@ -224,7 +267,35 @@ class WhisperTranscriber:
             for j, text in enumerate(texts):
                 offset = (b + j) * 30.0
                 segments.extend(self._segments(text, offset, len(batch[j]) / 16000))
-        return segments
+        return self._split_sentences(segments)
+
+
+class VocalSeparator:
+    """demucs (htdemucs) vocal stem; lazily loaded, optional dependency."""
+
+    def __init__(self, device: str = "cuda"):
+        from demucs.pretrained import get_model
+        self.device = torch.device(device)
+        LOG.info("loading demucs htdemucs")
+        self.model = get_model("htdemucs").to(self.device).eval()
+
+    def close(self):
+        self.model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def vocals(self, wave48k: torch.Tensor) -> torch.Tensor:
+        """[2, N] 48 kHz -> vocal stem [2, N] 48 kHz."""
+        import torchaudio
+        from demucs.apply import apply_model
+        sr = self.model.samplerate
+        mix = torchaudio.functional.resample(wave48k, 48000, sr)
+        ref = mix.mean(0)
+        mix = (mix - ref.mean()) / (ref.std() + 1e-8)
+        stems = apply_model(self.model, mix[None].to(self.device), split=True, overlap=0.25, progress=False)[0]
+        vocals = stems[self.model.sources.index("vocals")].cpu() * (ref.std() + 1e-8) + ref.mean()
+        return torchaudio.functional.resample(vocals, sr, 48000)
 
 
 def _norm(line: str) -> str:
@@ -248,7 +319,7 @@ def _block_overlap(lines: list[str], other: list[str]) -> float:
 
 
 HALLUCINATION_RE = re.compile(
-    r"(subtitles? by|subscribe|thanks? for watching|we'll be right back|amara\.org|字幕|作曲|作词|編曲|翻译|"
+    r"(subtitles? by|subscribe|thanks? for watching|we'll be right back|amara\.org|字幕|作曲|作词|作詞|編曲|编曲|词曲|作品|制作|翻译|翻譯|"
     r"転載|ご視聴ありがとう|チャンネル登録|시청해 주셔서|구독)", re.I)
 
 
@@ -491,7 +562,7 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
         raise ValueError(f"No audio files in {folder}")
     device = _resolve_device(cfg.device)
     need_whisper = cfg.lyrics_source in ("lrclib+whisper", "whisper") or cfg.style_source == "clap"
-    whisper = tagger = None
+    whisper = tagger = separator = None
     reports = []
     try:
         for index, path in enumerate(files):
@@ -514,23 +585,59 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
             meta = file_metadata(path)
             mono48 = wave.mean(0).numpy()
             wave16 = None
-            language = None
+            language = None if cfg.language in ("", "auto") else cfg.language
+            use_whisper = cfg.lyrics_source in ("whisper", "lrclib+whisper")
+
+            def whisper_audio():
+                nonlocal wave16, separator
+                if wave16 is None:
+                    source = wave
+                    if cfg.separate_vocals:
+                        try:
+                            if separator is None:
+                                separator = VocalSeparator(device)
+                            source = separator.vocals(wave)
+                            report.notes.append("transcribed the demucs vocal stem")
+                        except ImportError:
+                            report.notes.append("demucs not installed; transcribed the full mix")
+                        except Exception as exc:  # noqa: BLE001
+                            LOG.warning("vocal separation failed on %s: %s", path.name, exc)
+                            report.notes.append("vocal separation failed; transcribed the full mix")
+                    wave16 = _resample_mono(source, 16000)
+                return wave16
 
             # ---- lyrics
             lyrics = None
             if want_lyrics and cfg.lyrics_source in ("lrclib", "lrclib+whisper"):
+                if not meta["artist"]:
+                    report.notes.append("no artist tag / 'Artist - Title' name; LRCLIB matched by title+duration only")
                 found = fetch_lrclib(meta["artist"], meta["title"], meta["duration"] or report.seconds)
-                if found and len(found) >= cfg.min_lyrics_chars:
-                    lyrics = plain_to_sections(found)
-                    report.lyrics_source = "lrclib"
-            if (want_lyrics and lyrics is None and cfg.lyrics_source in ("whisper", "lrclib+whisper")) or \
-                    (want_style and need_whisper and cfg.lyrics_source != "none"):
+                if found and len(found["lyrics"]) >= cfg.min_lyrics_chars:
+                    accept = True
+                    if use_whisper:  # cross-check the database hit against what is actually sung
+                        if whisper is None:
+                            whisper = WhisperTranscriber(cfg.whisper_model, device)
+                        probe_audio = whisper_audio()
+                        probe = whisper.transcribe(probe_audio[: 16000 * 90], language or whisper.detect_language(probe_audio))
+                        score = lyrics_match_transcript(found["lyrics"], " ".join(t for _, _, t in probe))
+                        accept = score >= 0.35
+                        report.notes.append(f"LRCLIB '{found['artist']} - {found['title']}' matched transcript {score:.0%}"
+                                            + ("" if accept else " -> rejected"))
+                    if accept:
+                        lyrics = plain_to_sections(found["lyrics"])
+                        report.lyrics_source = "lrclib"
+                elif found is None:
+                    report.notes.append(f"LRCLIB: nothing found for '{meta['artist'] or '?'} - {meta['title']}'")
+            if (want_lyrics and lyrics is None and use_whisper) or (want_style and need_whisper and cfg.lyrics_source != "none"):
                 if whisper is None:
                     whisper = WhisperTranscriber(cfg.whisper_model, device)
-                wave16 = _resample_mono(wave, 16000)
-                language = whisper.detect_language(wave16)
+                audio16 = whisper_audio()
+                if language is None:
+                    language = whisper.detect_language(audio16)
+                    if language:
+                        report.notes.append(f"language detected: {LANGUAGES.get(language, language)}")
                 if want_lyrics and lyrics is None:
-                    chunks, dropped = clean_segments(whisper.transcribe(wave16, language))
+                    chunks, dropped = clean_segments(whisper.transcribe(audio16, language))
                     if dropped:
                         report.notes.append(f"{dropped} suspected hallucinated lines removed")
                     raw = "\n".join(t for _, _, t in chunks)
@@ -548,7 +655,7 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
                         if lyrics is None:
                             lyrics = heuristic_sections(chunks) if cfg.section_tags != "none" else raw + "\n"
             elif want_lyrics and lyrics is None:
-                report.notes.append("no lyrics found on LRCLIB")
+                report.notes.append("no lyrics written (LRCLIB only)")
             if lyrics is not None and cfg.section_tags == "claude" and report.lyrics_source == "lrclib":
                 improved = claude_sections(lyrics, cfg.claude_model)
                 if improved:
@@ -587,6 +694,8 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
             whisper.close()
         if tagger is not None:
             tagger.close()
+        if separator is not None:
+            separator.close()
     (folder / "_prepare_report.json").write_text(
         json.dumps([asdict(r) for r in reports], indent=1, ensure_ascii=False), encoding="utf-8")
     return reports
@@ -612,4 +721,5 @@ def summarize(reports: list[ItemReport]) -> str:
 
 
 __all__ = ["SidecarConfig", "ItemReport", "prepare_folder", "summarize", "WHISPER_CHOICES", "file_metadata",
-           "parse_stem", "heuristic_sections", "plain_to_sections", "assemble_style", "fetch_lrclib", "clean_segments"]
+           "parse_stem", "heuristic_sections", "plain_to_sections", "assemble_style", "fetch_lrclib", "clean_segments",
+           "lyrics_match_transcript", "VocalSeparator"]
