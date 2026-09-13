@@ -29,7 +29,7 @@ resulting `.safetensors` files are ordinary ComfyUI LoRAs.
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone <this repo> ComfyUI-YuE2-Trainer
+git clone https://github.com/speedyrulz/ComfyUI-YuE2-Trainer.git
 ```
 
 or drop/symlink this folder into `custom_nodes`. `soundfile` and `torchaudio` are the only extra
