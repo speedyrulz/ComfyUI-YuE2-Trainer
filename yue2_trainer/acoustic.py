@@ -32,7 +32,7 @@ class AcousticConfig:
     targets: str = "attention+mlp"
     train_acoustic_head: bool = False   # also adapt vae2llm / llm2vae / time embedder
     segment_seconds: float = 30.0       # random crop length (0 = whole song / chunk)
-    mode: str = "auto"                  # auto|full|melody|off  (CoT instruction used for the prefix)
+    mode: str = "full"                  # full|melody|off|auto  (CoT instruction used for the prefix)
     use_semantic_tokens: bool = False   # condition on semantic tokens for items that carry them
     timestep_sampling: str = "uniform"  # uniform | logit_normal
     shift: float = 1.0                  # sigma = shift*u / (1 + (shift-1)*u)

@@ -353,8 +353,9 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
                 DATASET.Input("dataset", tooltip="Encoded dataset (with latents)."),
                 io.Float.Input("segment_seconds", default=30.0, min=0.0, max=600.0, step=1.0,
                                tooltip="Random crop length per step; 0 trains on whole songs (needs more VRAM)."),
-                io.Combo.Input("prefix_mode", options=["auto", "full", "melody", "off"], default="auto",
-                               tooltip="Chain-of-thought instruction for the prefix. auto: chords in ABC -> full, ABC -> melody, none -> off."),
+                io.Combo.Input("prefix_mode", options=["full", "melody", "off", "auto"], default="full",
+                               tooltip="Planning instruction in the conditioning prefix; match the mode you generate with. "
+                                       "Items without an ABC score always use off. auto: chords -> full, else melody."),
                 io.Boolean.Input("use_semantic_tokens", default=False,
                                  tooltip="Condition on YuE2 semantic tokens for items that carry them (only YuE2 output "
                                          "folders do); otherwise text-only conditioning is used."),

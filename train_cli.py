@@ -174,7 +174,7 @@ def main(argv=None):
     pa = sub.add_parser("acoustic", help="Train the acoustic (MODEL) LoRA")
     add_common(pa)
     pa.add_argument("--segment-seconds", type=float, default=30.0)
-    pa.add_argument("--prefix-mode", default="auto", choices=["auto", "full", "melody", "off"])
+    pa.add_argument("--prefix-mode", default="full", choices=["full", "melody", "off", "auto"])
     pa.add_argument("--use-semantic", action="store_true", help="Condition on semantic tokens for items that carry them.")
     pa.add_argument("--train-acoustic-head", action="store_true")
     pa.add_argument("--timestep-sampling", default="uniform", choices=["uniform", "logit_normal"])

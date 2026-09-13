@@ -112,8 +112,8 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
 - `segment_seconds` (30): random crop per step. The crop keeps its absolute position inside the song
   (RoPE positions and the latent position table), so training crops look like inference. `0` trains whole
   songs (more VRAM).
-- `prefix_mode` (auto): instruction used in the prompt prefix. `auto` uses `full` when the item's ABC has
-  chord symbols, `melody` for a chord-free ABC, `off` when there is no ABC.
+- `prefix_mode` (full): planning instruction used in the conditioning prefix; match the mode you generate with.
+  Items without an ABC score always use `off`. `auto` picks `full` when the ABC has chord symbols, else `melody`.
 - `use_semantic_tokens` (off): when on, items with semantic tokens (YuE2 output folders) are conditioned exactly
   like inference (prefix + codec tokens). Otherwise items use the model's codec-dropout ("text-only") conditioning: only the
   text/ABC prefix is visible, and the NAR tokens keep the positions they would have after the codec tokens.
