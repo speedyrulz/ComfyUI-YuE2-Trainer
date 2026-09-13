@@ -61,14 +61,16 @@ YuE2 is not public (see *Limitations*).
 
 | field | how it is produced |
 |---|---|
-| lyrics | LRCLIB lookup by the file's artist/title tags or an `Artist - Title` file name; Whisper (`large-v3-turbo` by default) transcribes anything not found. Tracks with almost no speech get an empty lyrics file (instrumental). |
+| lyrics | `lrclib` looks the song up by the file's artist/title tags or an `Artist - Title` file name (exact words, but only for released songs). `whisper` (default fallback, large-v3) or `moss-audio` transcribe the demucs-isolated vocal stem; Whisper is markedly better on sung lyrics, MOSS-Audio tends to loop. The `lrclib+...` modes look up first and transcribe only when there is no hit; every database hit is cross-checked against a transcript and rejected if the words don't match. Tracks with almost no singing get an empty lyrics file (instrumental). |
 | `[Verse]` / `[Chorus]` tags | `heuristic` (repeated stanzas become choruses; long silent openings get `[Intro]`) or `claude` (Claude formats and fixes ASR slips; needs `ANTHROPIC_API_KEY`, falls back to the heuristic on any error) |
-| style | CLAP zero-shot tags (2 genres, 2 moods, up to 3 instruments, vocal type) + librosa tempo and key + the language Whisper detected, e.g. `Japanese, city pop, disco, upbeat, groovy, female vocal, synthesizer, bass guitar, 118 BPM` |
+| style | `moss-audio` (default): MOSS-Audio-4B-Instruct listens to three excerpts and writes a descriptive tag line, e.g. `Mandarin pop, electronic pop, male vocal, clear and expressive, synthesizer, drum machine, synth bass, 1980s synth-pop, danceable rhythm`. `qwen-omni`: Qwen2.5-Omni-3B, same idea, a bit less specific. `clap`: fixed-vocabulary zero-shot tags. All get the librosa tempo appended, and the detected language when Whisper runs. `artist` is prepended to every style line. |
+| `precision` | weight precision of the audio LLM: `bf16` (MOSS about 10 GB VRAM, Omni about 8 GB) or `nf4` (MOSS measured at 4.2 GB peak; needs `bitsandbytes`). GGUF is not an option here: MOSS-Audio's architecture isn't supported by llama.cpp, and the community GGUF build targets a separate C++ runtime. |
 
 Existing sidecars are never overwritten unless `overwrite` is on, so you can hand-correct files and rerun.
 The node outputs the scanned dataset (chain it into **YuE2 Encode Dataset**) plus a report that lists which files
-came from transcription and deserve a read-through; the folder also gets a `_prepare_report.json` with all tag
-scores. Models download from Hugging Face on first use (Whisper turbo about 1.6 GB, CLAP about 0.6 GB).
+came from transcription and deserve a read-through; the folder also gets a `_prepare_report.json` with details.
+Models download from Hugging Face on first use (MOSS-Audio about 10 GB, Whisper large-v3 about 3 GB, demucs about
+0.3 GB, CLAP about 0.6 GB). The MOSS-Audio model code is vendored under `yue2_trainer/vendor/moss_audio` (Apache-2.0).
 
 ```bash
 C:/ai/ComfyUI/venv/Scripts/python.exe prepare_dataset.py D:/songs --sections claude

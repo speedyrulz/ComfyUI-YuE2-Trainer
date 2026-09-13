@@ -30,6 +30,9 @@ LOG = logging.getLogger("yue2_trainer.sidecars")
 DEFAULT_WHISPER = "openai/whisper-large-v3"
 DEFAULT_CLAP = "laion/larger_clap_music_and_speech"
 DEFAULT_CLAUDE = "claude-opus-5"
+DEFAULT_OMNI = "Qwen/Qwen2.5-Omni-3B"
+DEFAULT_MOSS = "OpenMOSS-Team/MOSS-Audio-4B-Instruct"
+PRECISIONS = ["bf16", "nf4"]
 WHISPER_CHOICES = [DEFAULT_WHISPER, "openai/whisper-large-v3-turbo", "openai/whisper-medium", "openai/whisper-small"]
 
 GENRES = ["pop", "rock", "hip hop", "rap", "r&b", "soul", "funk", "jazz", "blues", "country", "folk", "metal",
@@ -58,12 +61,16 @@ MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 
 
 @dataclass
 class SidecarConfig:
-    lyrics_source: str = "lrclib+whisper"   # lrclib+whisper | lrclib | whisper | none
+    lyrics_source: str = "lrclib+whisper"   # lrclib+whisper | whisper | lrclib | lrclib+moss-audio | moss-audio | none
     whisper_model: str = DEFAULT_WHISPER
     language: str = "auto"                  # auto or a Whisper language code (en, zh, ja, ...)
     separate_vocals: bool = True            # run demucs and transcribe the vocal stem (much more accurate)
-    style_source: str = "clap"              # clap | none
+    style_source: str = "moss-audio"        # moss-audio | qwen-omni | clap | none
     clap_model: str = DEFAULT_CLAP
+    omni_model: str = DEFAULT_OMNI
+    moss_model: str = DEFAULT_MOSS
+    precision: str = "bf16"                 # bf16 | nf4  (audio-LLM weight precision; nf4 uses about a third of the VRAM)
+    artist: str = ""                        # prepended to every style prompt (also works as a trigger phrase)
     section_tags: str = "heuristic"         # heuristic | claude | none
     claude_model: str = DEFAULT_CLAUDE
     default_style: str = ""                 # used when style_source is none
@@ -323,16 +330,30 @@ HALLUCINATION_RE = re.compile(
     r"転載|ご視聴ありがとう|チャンネル登録|시청해 주셔서|구독)", re.I)
 
 
+LOOP_RE = re.compile(r"(?i)((?:[^,，、\s]+\s+){0,6}?[^,，、\s]+)(?:[,，、\s]+\1(?=[,，、\s]|$)){2,}")
+
+
+def collapse_loops(text: str) -> str:
+    """'my heart, my heart, my heart, my heart' -> 'my heart' (decoder loops inside one line)."""
+    previous = None
+    while previous != text:
+        previous = text
+        text = LOOP_RE.sub(lambda m: m.group(1), text)
+    return text.strip(" ,，、")
+
+
 def clean_segments(chunks: list[tuple[float, float, str]], max_consecutive: int = 2,
-                   max_total: int = 6) -> tuple[list[tuple[float, float, str]], int]:
-    """Drop Whisper hallucinations: credit/subtitle phrases, long runs of one line, lines repeated everywhere."""
+                   max_total: int = 8) -> tuple[list[tuple[float, float, str]], int]:
+    """Drop transcription hallucinations: credit/subtitle phrases, long runs of one line, and longer lines
+    that are repeated an implausible number of times (short refrains such as "yeah" or "passion" are kept)."""
+    chunks = [(a, b, collapse_loops(t)) for a, b, t in chunks]
     counts: dict[str, int] = {}
     for _, _, text in chunks:
         counts[_norm(text)] = counts.get(_norm(text), 0) + 1
     out, dropped, previous, run = [], 0, None, 0
     for start, end, text in chunks:
         key = _norm(text)
-        if not key or HALLUCINATION_RE.search(text) or counts[key] >= max_total:
+        if not key or HALLUCINATION_RE.search(text) or (counts[key] >= max_total and len(key) >= 8):
             dropped += 1
             continue
         run = run + 1 if key == previous else 1
@@ -531,6 +552,168 @@ def pick_tags(tagger: ClapTagger, audio_emb: torch.Tensor, temperature: float = 
     }
 
 
+# ── style: audio LLM (Qwen2.5-Omni) ───────────────────────────────────────────
+
+OMNI_SYSTEM = ("You are a music tagging assistant for a text-to-music model. Listen to the audio excerpts and describe "
+               "the music as ONE line of comma-separated tags. Always include, in this order: 2 genre or subgenre tags; "
+               "2 mood or energy tags; the vocal type (male vocal, female vocal, duet, rap, or instrumental) and one tag "
+               "for the vocal delivery (e.g. breathy, powerful, smooth, raspy); 3 to 5 tags naming the main instruments "
+               "and sounds you hear; 2 production or era descriptors (e.g. lo-fi, polished, 80s synth, live band, "
+               "distorted); one tag for the rhythmic feel (e.g. driving, laid-back, syncopated, half-time). "
+               "Lowercase, no full sentences, no artist or song names, no BPM or time signature. Output only the tag line.")
+OMNI_USER = "Describe this music as tags."
+
+
+class OmniTagger:
+    """Qwen2.5-Omni (thinker only): listens to excerpts and writes a free-form tag line."""
+
+    def __init__(self, model_name: str = DEFAULT_OMNI, device: str = "cuda", precision: str = "bf16"):
+        from transformers import Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
+        self.device = torch.device(device)
+        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        LOG.info("loading %s (%s)", model_name, precision)
+        self.processor = Qwen2_5OmniProcessor.from_pretrained(model_name)
+        quant = quantization_config(precision) if self.device.type == "cuda" else None
+        if quant is not None:
+            self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+                model_name, quantization_config=quant, device_map={"": str(self.device)})
+        else:
+            self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(model_name, torch_dtype=dtype)
+            self.model.to(self.device)
+        self.model.eval()
+
+    def close(self):
+        self.model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def describe(self, wave16k: np.ndarray) -> str:
+        conversation = [
+            {"role": "system", "content": [{"type": "text", "text": OMNI_SYSTEM}]},
+            {"role": "user", "content": [{"type": "audio", "audio": wave16k}, {"type": "text", "text": OMNI_USER}]},
+        ]
+        text = self.processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+        inputs = self.processor(text=text, audio=[wave16k], sampling_rate=16000, return_tensors="pt", padding=True)
+        inputs = inputs.to(self.device)
+        if "input_features" in inputs:
+            inputs["input_features"] = inputs["input_features"].to(self.model.dtype)
+        out = self.model.generate(**inputs, max_new_tokens=160, do_sample=False)
+        generated = out[:, inputs["input_ids"].shape[1]:]
+        reply = self.processor.batch_decode(generated, skip_special_tokens=True)[0]
+        return clean_tag_line(reply)
+
+
+def clean_tag_line(reply: str) -> str:
+    """Normalise an LLM answer into 'tag, tag, tag'."""
+    line = reply.strip().splitlines()
+    line = next((l for l in line if l.strip()), "")
+    line = re.sub(r"^(tags?|description)\s*:\s*", "", line, flags=re.I).strip().strip("\"'`.")
+    tags = [t.strip(" .;\"'`") for t in re.split(r"[,;\n]+", line)]
+    seen, out = set(), []
+    for t in tags:
+        if t and t.lower() not in seen and len(t) < 48:
+            seen.add(t.lower())
+            out.append(t)
+    return ", ".join(out)
+
+
+def omni_excerpt(mono48: np.ndarray, seconds: float = 20.0, count: int = 3) -> np.ndarray:
+    """Concatenate ``count`` excerpts (start / middle / end) into one 16 kHz clip for the audio LLM."""
+    import torchaudio
+    pieces = excerpts(mono48, seconds, count)
+    joined = np.concatenate(pieces)
+    return torchaudio.functional.resample(torch.from_numpy(joined)[None], 48000, 16000)[0].numpy()
+
+
+# ── style + lyrics: MOSS-Audio (audio-understanding LLM) ───────────────────────
+
+MOSS_TAG_PROMPT = ("Describe this music for a text-to-music model as ONE line of comma-separated tags. Include, in this "
+                   "order: two genre or subgenre tags; two mood or energy tags; the vocal type (male vocal, female vocal, "
+                   "duet, rap, or instrumental) plus one tag for how the singer sounds; three to five tags naming the "
+                   "specific instruments and sounds you hear; two tags for the production style or era; one tag for the "
+                   "rhythmic feel. Be specific to this recording. Lowercase, no sentences, no artist or song names, no BPM "
+                   "or time signature. Output only the tag line.")
+MOSS_LYRICS_PROMPT = ("Transcribe the sung lyrics of this song exactly as sung, in the original language. Write one sung "
+                      "line per output line and leave one blank line between sections such as verses and choruses. "
+                      "Do not translate, do not add titles, timestamps, commentary or descriptions. If there is no "
+                      "singing, output exactly: [instrumental]")
+
+
+def quantization_config(precision: str):
+    if precision in ("", "bf16", "fp16", "none"):
+        return None
+    try:
+        from transformers import BitsAndBytesConfig
+        import bitsandbytes  # noqa: F401
+    except ImportError:
+        LOG.warning("bitsandbytes is not installed; loading in bf16 instead of %s", precision)
+        return None
+    if precision == "int8":  # kept for the CLI; produced empty answers in testing, so it is not offered in the node
+        return BitsAndBytesConfig(load_in_8bit=True)
+    return BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16,
+                              bnb_4bit_use_double_quant=True)
+
+
+class MossAudioTagger:
+    """MOSS-Audio-4B-Instruct: music description (tags) and sung-lyrics transcription."""
+
+    def __init__(self, model_name: str = DEFAULT_MOSS, device: str = "cuda", precision: str = "bf16"):
+        from .vendor.moss_audio.modeling_moss_audio import MossAudioModel
+        from .vendor.moss_audio.processing_moss_audio import MossAudioProcessor
+        self.device = torch.device(device)
+        LOG.info("loading %s (%s)", model_name, precision)
+        kwargs = {"device_map": {"": str(self.device)} if self.device.type == "cuda" else None}
+        quant = quantization_config(precision) if self.device.type == "cuda" else None
+        if quant is not None:
+            kwargs["quantization_config"] = quant
+        else:
+            kwargs["dtype"] = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        self.model = MossAudioModel.from_pretrained(model_name, **kwargs).eval()
+        if self.model.device.type != self.device.type:
+            self.model.to(self.device)
+        self.processor = MossAudioProcessor.from_pretrained(model_name, enable_time_marker=True)
+        self.sample_rate = int(self.processor.config.mel_sr)
+
+    def close(self):
+        self.model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def ask(self, wave: np.ndarray, prompt: str, max_new_tokens: int = 256, repetition_penalty: float = 1.0) -> str:
+        """``wave`` is mono at ``self.sample_rate``."""
+        inputs = self.processor(text=prompt, audios=[wave.astype(np.float32)], return_tensors="pt")
+        inputs = inputs.to(self.model.device)
+        if inputs.get("audio_data") is not None:
+            inputs["audio_data"] = inputs["audio_data"].to(self.model.dtype)
+        inputs["audio_input_mask"] = inputs["input_ids"] == self.processor.audio_token_id
+        out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1, use_cache=True,
+                                  repetition_penalty=repetition_penalty)
+        return self.processor.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+    def describe(self, wave: np.ndarray) -> str:
+        return clean_tag_line(self.ask(wave, MOSS_TAG_PROMPT, max_new_tokens=160))
+
+    def transcribe(self, wave: np.ndarray, chunk_seconds: float = 60.0) -> list[tuple[float, float, str]]:
+        """Lyrics as (start, end, line) segments; long songs are transcribed in chunks."""
+        sr, n = self.sample_rate, int(chunk_seconds * self.sample_rate)
+        segments = []
+        for start in range(0, len(wave), n):
+            piece = wave[start:start + n]
+            if len(piece) < sr:
+                continue
+            text = self.ask(piece, MOSS_LYRICS_PROMPT, max_new_tokens=700, repetition_penalty=1.1)
+            if "[instrumental]" in text.lower():
+                continue
+            lines = [l.strip() for l in text.splitlines()]
+            lines = [l for l in lines if l and not l.startswith(("[", "(", "<"))]
+            offset, step = start / sr, (len(piece) / sr) / max(1, len(lines))
+            for i, line in enumerate(lines):
+                segments.append((offset + i * step, offset + (i + 1) * step, line))
+        return segments
+
+
 # ── driver ─────────────────────────────────────────────────────────────────────
 
 def _resolve_device(spec: str) -> str:
@@ -562,7 +745,7 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
         raise ValueError(f"No audio files in {folder}")
     device = _resolve_device(cfg.device)
     need_whisper = cfg.lyrics_source in ("lrclib+whisper", "whisper")  # language detection rides on Whisper
-    whisper = tagger = separator = None
+    whisper = tagger = separator = omni = moss = None
     reports = []
     try:
         for index, path in enumerate(files):
@@ -587,6 +770,26 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
             wave16 = None
             language = None if cfg.language in ("", "auto") else cfg.language
             use_whisper = cfg.lyrics_source in ("whisper", "lrclib+whisper")
+            use_moss_lyrics = cfg.lyrics_source in ("moss-audio", "lrclib+moss-audio")
+
+            def moss_tagger():
+                nonlocal moss
+                if moss is None:
+                    moss = MossAudioTagger(cfg.moss_model, device, cfg.precision)
+                return moss
+
+            def moss_audio():
+                """Vocal stem (if enabled) at MOSS's sample rate."""
+                nonlocal separator
+                source = wave
+                if cfg.separate_vocals:
+                    try:
+                        if separator is None:
+                            separator = VocalSeparator(device)
+                        source = separator.vocals(wave)
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning("vocal separation failed on %s: %s", path.name, exc)
+                return _resample_mono(source, moss_tagger().sample_rate)
 
             def whisper_audio():
                 nonlocal wave16, separator
@@ -614,7 +817,13 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
                 found = fetch_lrclib(meta["artist"], meta["title"], meta["duration"] or report.seconds)
                 if found and len(found["lyrics"]) >= cfg.min_lyrics_chars:
                     accept = True
-                    if use_whisper:  # cross-check the database hit against what is actually sung
+                    if use_moss_lyrics:  # cross-check the database hit against what MOSS-Audio hears
+                        probe = moss_tagger().transcribe(moss_audio()[: moss_tagger().sample_rate * 90])
+                        score = lyrics_match_transcript(found["lyrics"], " ".join(t for _, _, t in probe))
+                        accept = score >= 0.35
+                        report.notes.append(f"LRCLIB '{found['artist']} - {found['title']}' matched transcript {score:.0%}"
+                                            + ("" if accept else " -> rejected"))
+                    elif use_whisper:  # cross-check the database hit against what is actually sung
                         if whisper is None:
                             whisper = WhisperTranscriber(cfg.whisper_model, device)
                         probe_audio = whisper_audio()
@@ -628,6 +837,25 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
                         report.lyrics_source = "lrclib"
                 elif found is None:
                     report.notes.append(f"LRCLIB: nothing found for '{meta['artist'] or '?'} - {meta['title']}'")
+            if use_moss_lyrics and want_lyrics and lyrics is None:
+                chunks, dropped = clean_segments(moss_tagger().transcribe(moss_audio()))
+                if dropped:
+                    report.notes.append(f"{dropped} suspected hallucinated lines removed")
+                raw = "\n".join(t for _, _, t in chunks)
+                if cfg.separate_vocals:
+                    report.notes.append("transcribed the demucs vocal stem with MOSS-Audio")
+                if len(raw) < cfg.min_lyrics_chars:
+                    report.notes.append("little or no singing found; treated as instrumental")
+                    lyrics, report.lyrics_source = "", "moss-audio (instrumental)"
+                else:
+                    report.lyrics_source = "moss-audio"
+                    lyrics = None
+                    if cfg.section_tags == "claude":
+                        lyrics = claude_sections(raw, cfg.claude_model)
+                        if lyrics is not None:
+                            report.lyrics_source = "moss-audio+claude"
+                    if lyrics is None:
+                        lyrics = heuristic_sections(chunks) if cfg.section_tags != "none" else raw + "\n"
             if use_whisper and ((want_lyrics and lyrics is None) or (want_style and language is None)):
                 if whisper is None:
                     whisper = WhisperTranscriber(cfg.whisper_model, device)
@@ -667,7 +895,33 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
 
             # ---- style
             if want_style:
-                if cfg.style_source == "clap":
+                if cfg.style_source == "moss-audio":
+                    described = moss_tagger().describe(_resample_mono(
+                        torch.from_numpy(np.concatenate(excerpts(mono48, 20.0, 3)))[None].repeat(2, 1),
+                        moss_tagger().sample_rate))
+                    tempo, key = tempo_and_key(mono48)
+                    parts = [LANGUAGES.get(language, language)] if language else []
+                    parts.append(described)
+                    if tempo:
+                        parts.append(f"{int(tempo)} BPM")
+                    style = ", ".join(p for p in parts if p)
+                    report.tags = {"moss-audio": described}
+                    report.tempo, report.key = tempo, key
+                    report.style_source = "moss-audio"
+                elif cfg.style_source == "qwen-omni":
+                    if omni is None:
+                        omni = OmniTagger(cfg.omni_model, device, cfg.precision)
+                    described = omni.describe(omni_excerpt(mono48))
+                    tempo, key = tempo_and_key(mono48)
+                    parts = [LANGUAGES.get(language, language)] if language else []
+                    parts.append(described)
+                    if tempo:
+                        parts.append(f"{int(tempo)} BPM")
+                    style = ", ".join(p for p in parts if p)
+                    report.tags = {"omni": described}
+                    report.tempo, report.key = tempo, key
+                    report.style_source = "qwen-omni"
+                elif cfg.style_source == "clap":
                     if tagger is None:
                         tagger = ClapTagger(cfg.clap_model, device)
                     emb = tagger.audio_embed(excerpts(mono48, cfg.excerpt_seconds, cfg.excerpts))
@@ -683,6 +937,9 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
                 else:
                     style = cfg.default_style
                     report.style_source = "default"
+                artist = cfg.artist.strip().strip(",")
+                if artist:
+                    style = f"{artist}, {style}" if style else artist
                 if style:
                     style_path.write_text(style + "\n", encoding="utf-8")
                     report.style = style
@@ -696,6 +953,10 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
             tagger.close()
         if separator is not None:
             separator.close()
+        if omni is not None:
+            omni.close()
+        if moss is not None:
+            moss.close()
     (folder / "_prepare_report.json").write_text(
         json.dumps([asdict(r) for r in reports], indent=1, ensure_ascii=False), encoding="utf-8")
     return reports
@@ -722,4 +983,5 @@ def summarize(reports: list[ItemReport]) -> str:
 
 __all__ = ["SidecarConfig", "ItemReport", "prepare_folder", "summarize", "WHISPER_CHOICES", "file_metadata",
            "parse_stem", "heuristic_sections", "plain_to_sections", "assemble_style", "fetch_lrclib", "clean_segments",
-           "lyrics_match_transcript", "VocalSeparator"]
+           "lyrics_match_transcript", "VocalSeparator", "OmniTagger", "clean_tag_line", "DEFAULT_OMNI", "collapse_loops",
+           "MossAudioTagger", "DEFAULT_MOSS", "PRECISIONS", "quantization_config"]

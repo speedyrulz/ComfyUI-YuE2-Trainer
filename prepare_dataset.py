@@ -21,11 +21,15 @@ from yue2_trainer.sidecars import DEFAULT_CLAUDE, DEFAULT_WHISPER, SidecarConfig
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("folder")
-    p.add_argument("--lyrics", default="lrclib+whisper", choices=["lrclib+whisper", "lrclib", "whisper", "none"])
+    p.add_argument("--lyrics", default="lrclib+whisper",
+                   choices=["lrclib+whisper", "whisper", "lrclib", "lrclib+moss-audio", "moss-audio", "none"])
+    p.add_argument("--precision", default="bf16", choices=["bf16", "nf4"],
+                   help="Audio-LLM weight precision (nf4 needs bitsandbytes and uses about a third of the VRAM).")
     p.add_argument("--whisper-model", default=DEFAULT_WHISPER)
     p.add_argument("--language", default="auto", help="Whisper language code (en, zh, ja, ...) or auto.")
     p.add_argument("--no-separate", action="store_true", help="Transcribe the full mix instead of the demucs vocal stem.")
-    p.add_argument("--style", default="clap", choices=["clap", "none"])
+    p.add_argument("--style", default="moss-audio", choices=["moss-audio", "qwen-omni", "clap", "none"])
+    p.add_argument("--artist", default="", help="Prepended to every style prompt (artist / album name).")
     p.add_argument("--default-style", default="", help="Style text when --style none.")
     p.add_argument("--sections", default="heuristic", choices=["heuristic", "claude", "none"],
                    help="How to add [Verse]/[Chorus] tags. 'claude' needs ANTHROPIC_API_KEY (or ant auth login).")
@@ -37,7 +41,8 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = SidecarConfig(lyrics_source=args.lyrics, whisper_model=args.whisper_model, style_source=args.style,
                         language=args.language, separate_vocals=not args.no_separate,
-                        default_style=args.default_style, section_tags=args.sections, claude_model=args.claude_model,
+                        default_style=args.default_style, artist=args.artist, precision=args.precision,
+                        section_tags=args.sections, claude_model=args.claude_model,
                         overwrite=args.overwrite, device=args.device)
 
     def progress(done, total, name):

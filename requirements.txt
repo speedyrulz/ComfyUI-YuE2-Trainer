@@ -7,5 +7,10 @@ requests
 # optional: TensorBoard logging toggle on the training nodes
 tensorboard
 demucs
+# optional: int8 / nf4 precision for the audio LLMs in Prepare Dataset
+bitsandbytes
+# MOSS-Audio (vendored model code) needs these
+einops
+tiktoken
 # optional: Claude-based [Verse]/[Chorus] tagging in Prepare Dataset
 anthropic

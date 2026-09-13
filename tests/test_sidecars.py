@@ -53,6 +53,13 @@ def test_clean_segments_drops_hallucinations():
     texts = [t for _, _, t in kept]
     assert texts == ["real line", "real line", "another line"]
     assert dropped == 12
+    # a looping long phrase is dropped, a short refrain repeated across the song is kept
+    loop = [(float(i), i + 1.0, "thank you for listening to this song") for i in range(10)]
+    refrain = []
+    for i in range(10):  # a short refrain interleaved with other lines, as in a real chorus
+        refrain += [(20.0 + 5 * i, 21.0 + 5 * i, "passion"), (21.0 + 5 * i, 22.0 + 5 * i, f"other line {i}")]
+    kept, dropped = clean_segments(loop + refrain)
+    assert sum(t == "passion" for _, _, t in kept) == 10 and len(kept) == 20 and dropped == 10
 
 
 def test_fuzzy_chorus_detection():
@@ -82,3 +89,17 @@ def test_split_sentences_and_credit_filter():
     assert out[0][1] == 2.0 and out[2][0] == 4.0
     kept, dropped = clean_segments([(0.0, 1.0, "编曲 李宗盛"), (1.0, 2.0, "今晚不眠快乐无限")])
     assert [t for _, _, t in kept] == ["今晚不眠快乐无限"] and dropped == 1
+
+
+def test_clean_tag_line():
+    from yue2_trainer.sidecars import clean_tag_line
+    assert clean_tag_line("Tags: indie rock, dreamy, female vocal, jangly guitar, reverb, mid-tempo.\nMore text") == \
+        "indie rock, dreamy, female vocal, jangly guitar, reverb, mid-tempo"
+    assert clean_tag_line('"pop, Pop, upbeat"') == "pop, upbeat"
+
+
+def test_collapse_loops():
+    from yue2_trainer.sidecars import collapse_loops
+    assert collapse_loops("my heart, my heart, my heart, my heart, my heart") == "my heart"
+    assert collapse_loops("勇敢 勇敢 勇敢 勇敢") == "勇敢"
+    assert collapse_loops("hold on, hold on tonight") == "hold on, hold on tonight"

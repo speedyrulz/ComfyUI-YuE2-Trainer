@@ -22,7 +22,7 @@ from .yue2_trainer.constants import FRAMES_PER_SECOND
 from .yue2_trainer.dataset import Dataset, Item, cache_key, load_cache, save_cache, scan_folder
 from .yue2_trainer.lora import TARGET_PRESETS, load_lora_file, save_lora_file
 from .yue2_trainer.parallel import device_choices
-from .yue2_trainer.sidecars import DEFAULT_CLAUDE, SidecarConfig, WHISPER_CHOICES, prepare_folder, summarize
+from .yue2_trainer.sidecars import DEFAULT_CLAUDE, PRECISIONS, SidecarConfig, WHISPER_CHOICES, prepare_folder, summarize
 from .yue2_trainer.planner import PlannerConfig, train_planner_lora
 
 DATASET = io.Custom("YUE2_DATASET")
@@ -112,7 +112,12 @@ class YuE2TrainerPrepareDataset(io.ComfyNode):
                         "Existing sidecars are kept unless overwrite is on. Outputs the scanned dataset.",
             inputs=[
                 io.String.Input("folder", default="", tooltip="Absolute path, or a folder name inside ComfyUI/input."),
-                io.Combo.Input("lyrics_source", options=["lrclib+whisper", "lrclib", "whisper", "none"], default="lrclib+whisper"),
+                io.Combo.Input("lyrics_source",
+                               options=["lrclib+whisper", "whisper", "lrclib", "lrclib+moss-audio", "moss-audio", "none"],
+                               default="lrclib+whisper",
+                               tooltip="Where lyrics come from. lrclib = lookup by artist/title (needs tags or 'Artist - "
+                                       "Title' names). whisper (recommended) / moss-audio = transcription of the vocal "
+                                       "stem; the lrclib+ variants transcribe only when no verified database hit exists."),
                 io.Combo.Input("whisper_model", options=WHISPER_CHOICES, default=WHISPER_CHOICES[0], advanced=True),
                 io.String.Input("language", default="auto",
                                 tooltip="Whisper language code (en, zh, ja, ko, es, ...) or auto."),
@@ -122,8 +127,16 @@ class YuE2TrainerPrepareDataset(io.ComfyNode):
                                tooltip="How [Verse]/[Chorus] tags are added. 'claude' uses the Anthropic API "
                                        "(ANTHROPIC_API_KEY) and falls back to the heuristic on any failure."),
                 io.String.Input("claude_model", default=DEFAULT_CLAUDE, advanced=True),
-                io.Combo.Input("style_source", options=["clap", "none"], default="clap",
-                               tooltip="clap: genre/mood/instrument/vocal tags + BPM + language. none: use default_style."),
+                io.Combo.Input("style_source", options=["moss-audio", "qwen-omni", "clap", "none"], default="moss-audio",
+                               tooltip="moss-audio: MOSS-Audio-4B-Instruct (~10 GB download) listens and writes a descriptive "
+                                       "tag line. qwen-omni: Qwen2.5-Omni-3B (~7 GB). clap: fixed-vocabulary tags. none: use "
+                                       "default_style. All add BPM; language is added when Whisper runs."),
+                io.Combo.Input("precision", options=PRECISIONS, default="bf16",
+                               tooltip="Weight precision for the audio LLM (moss-audio / qwen-omni). bf16 needs ~10 GB "
+                                       "(MOSS) / ~8 GB (Omni); nf4 about 4 GB (needs bitsandbytes)."),
+                io.String.Input("artist", default="",
+                                tooltip="Prepended to every style prompt, e.g. an artist or album name. Use the same "
+                                        "phrase in your generation prompts to trigger the LoRA."),
                 io.String.Input("default_style", multiline=True, default="", tooltip="Style text when style_source is none."),
                 io.Boolean.Input("overwrite", default=False, tooltip="Regenerate sidecars that already exist."),
                 io.Combo.Input("device", options=[d for d in device_choices() if d != "all"], default="auto"),
@@ -134,7 +147,7 @@ class YuE2TrainerPrepareDataset(io.ComfyNode):
 
     @classmethod
     def execute(cls, folder, lyrics_source, whisper_model, language, separate_vocals, section_tags, claude_model,
-                style_source, default_style, overwrite, device, recursive):
+                style_source, precision, artist, default_style, overwrite, device, recursive):
         path = Path(folder.strip().strip('"'))
         if not path.is_absolute():
             candidate = Path(folder_paths.get_input_directory()) / path
@@ -143,7 +156,8 @@ class YuE2TrainerPrepareDataset(io.ComfyNode):
         cfg = SidecarConfig(lyrics_source=lyrics_source, whisper_model=whisper_model, style_source=style_source,
                             language=language.strip().lower() or "auto", separate_vocals=separate_vocals,
                             section_tags=section_tags, claude_model=claude_model, default_style=default_style,
-                            overwrite=overwrite, device="auto" if device == "auto" else device)
+                            artist=artist, precision=precision, overwrite=overwrite,
+                            device="auto" if device == "auto" else device)
         if cfg.device == "auto":
             cfg.device = str(comfy.model_management.get_torch_device())
         comfy.model_management.unload_all_models()

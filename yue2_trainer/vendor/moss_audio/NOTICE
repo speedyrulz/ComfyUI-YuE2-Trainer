@@ -1,0 +1,3 @@
+The files in this directory are vendored from https://github.com/OpenMOSS/MOSS-Audio
+(OpenMOSS Team), licensed under the Apache License, Version 2.0 (see ../../../LICENSE).
+Only the package-relative imports were changed.
