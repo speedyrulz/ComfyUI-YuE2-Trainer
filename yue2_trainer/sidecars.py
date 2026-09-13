@@ -215,7 +215,7 @@ class WhisperTranscriber:
         segments = []
         for b in range(0, len(pieces), batch_size):
             batch = pieces[b:b + batch_size]
-            kwargs = {"task": "transcribe", "return_timestamps": True, "max_new_tokens": 440}
+            kwargs = {"task": "transcribe", "return_timestamps": True}
             if language:
                 kwargs["language"] = language
             ids = self.model.generate(self._features(batch), **kwargs)
@@ -484,6 +484,8 @@ def prepare_folder(folder, cfg: SidecarConfig, recursive: bool = True,
                    progress: Optional[Callable[[int, int, str], None]] = None,
                    interrupt: Optional[Callable[[], None]] = None) -> list[ItemReport]:
     folder = Path(folder)
+    for noisy in ("httpx", "huggingface_hub", "urllib3"):  # hub file probes are not useful in the ComfyUI log
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     files = list_audio(folder, recursive)
     if not files:
         raise ValueError(f"No audio files in {folder}")
