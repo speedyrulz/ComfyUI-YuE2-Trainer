@@ -132,6 +132,24 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
 Both trainers use gradient checkpointing, bf16 autocast, fp32 LoRA weights, grad clipping, and run
 one item per micro-step (`batch_size × grad_accumulation` items per optimizer step).
 
+### Watching a run
+
+Every step (or every `log_every` steps) the console shows
+
+```
+YuE2 acoustic step 120/300  loss 0.8412  avg20 0.8630  lr 7.65e-05 grad 0.412  elapsed 4:10  eta 6:15
+```
+
+Turn on `tensorboard` to also log `loss/step`, `loss/avg20`, `lr` and `grad_norm` per step, plus the run
+configuration and final result as text. Runs land in `ComfyUI/output/yue2_tensorboard/<save_name>_<timestamp>`
+(`tensorboard_dir` changes the parent folder); view them with
+
+```bash
+tensorboard --logdir ComfyUI/output/yue2_tensorboard
+```
+
+The CLI equivalent is `--tensorboard DIR` (plus `--log-every N`, `--run-name`).
+
 ### Choosing GPUs / training on both GPUs
 
 Both training nodes (and the CLI's `--devices`) take a `devices` setting:

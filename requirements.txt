@@ -4,5 +4,8 @@ torchaudio
 librosa
 mutagen
 requests
+# optional: TensorBoard logging toggle on the training nodes
+tensorboard
+demucs
 # optional: Claude-based [Verse]/[Chorus] tagging in Prepare Dataset
 anthropic

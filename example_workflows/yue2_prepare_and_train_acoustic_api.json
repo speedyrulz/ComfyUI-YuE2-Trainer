@@ -77,7 +77,10 @@
    "existing_lora": "[None]",
    "save_every": 50,
    "save_name": "yue2_acoustic",
-   "devices": "auto"
+   "devices": "auto",
+   "log_every": 1,
+   "tensorboard": false,
+   "tensorboard_dir": "yue2_tensorboard"
   }
  },
  "5": {

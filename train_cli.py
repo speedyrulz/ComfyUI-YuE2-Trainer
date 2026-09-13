@@ -157,6 +157,10 @@ def add_common(p):
     p.add_argument("--no-checkpointing", action="store_true")
     p.add_argument("--devices", default="auto",
                    help="auto | cuda:N | all (data parallel on every GPU) | cuda:0,cuda:1")
+    p.add_argument("--log-every", type=int, default=1, help="Console step/loss line every N steps.")
+    p.add_argument("--tensorboard", default=None, metavar="DIR",
+                   help="Log loss/lr/grad-norm to TensorBoard under DIR (tensorboard --logdir DIR).")
+    p.add_argument("--run-name", default="", help="TensorBoard run name (default: output name).")
     p.add_argument("--existing-lora", default=None)
     p.add_argument("--save-every", type=int, default=0)
     p.add_argument("--out", required=True, help="Output LoRA name (goes to models/loras) or path.")
@@ -206,8 +210,7 @@ def main(argv=None):
     steps = 0 if args.dry_run else args.steps
 
     def progress(done, total, loss):
-        if done == 1 or done % 10 == 0 or done == total:
-            logging.info("step %d/%d loss %.5f", done, total, loss)
+        pass  # the trainer's TrainMonitor prints step/loss lines
 
     def save_partial(sd, n):
         from yue2_trainer.lora import save_lora_file
@@ -229,7 +232,9 @@ def main(argv=None):
                                  timestep_sampling=args.timestep_sampling, shift=args.shift, warmup_steps=args.warmup,
                                  seed=args.seed, lora_dtype=args.lora_dtype,
                                  gradient_checkpointing=not args.no_checkpointing, optimizer=args.optimizer,
-                                 devices=args.devices, existing_lora=existing, save_every=args.save_every, save_callback=save_partial)
+                                 devices=args.devices, existing_lora=existing,
+                                 log_every=args.log_every, tensorboard_dir=args.tensorboard or "",
+                                 run_name=args.run_name or Path(args.out).stem, save_every=args.save_every, save_callback=save_partial)
             result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress)
         else:
             from yue2_trainer.planner import PlannerConfig, train_planner_lora
@@ -239,6 +244,8 @@ def main(argv=None):
                                 max_tokens=args.max_tokens, warmup_steps=args.warmup, seed=args.seed,
                                 lora_dtype=args.lora_dtype, gradient_checkpointing=not args.no_checkpointing,
                                 optimizer=args.optimizer, devices=args.devices, existing_lora=existing,
+                                log_every=args.log_every, tensorboard_dir=args.tensorboard or "",
+                                run_name=args.run_name or Path(args.out).stem,
                                 save_every=args.save_every, save_callback=save_partial)
             result = train_planner_lora(clip, dataset, cfg, progress=progress)
     out = save_result(result, args, args.command)

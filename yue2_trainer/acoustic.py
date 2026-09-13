@@ -15,6 +15,7 @@ from .constants import FRAMES_PER_SECOND, MODEL_KEY_PREFIX, CONTEXT
 from .dataset import Dataset, Item
 from .forward import nar_forward
 from .lora import create_lora, select_target_modules, count_parameters
+from .monitor import TrainMonitor
 from .parallel import (Replica, clone_patcher_for_device, free_replicas, reduce_gradients, resolve_devices,
                        run_on_replicas, split_counts, sync_lora_weights)
 from .prefix import PrefixCache, build_acoustic_prefix, load_clip_for_prefill, music_prefix_ids, resolve_mode
@@ -45,6 +46,9 @@ class AcousticConfig:
     gradient_checkpointing: bool = True
     optimizer: str = "AdamW"
     devices: str = "auto"               # auto | cuda:N | all | cuda:0,cuda:1
+    log_every: int = 1                  # console line every N steps
+    tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
+    run_name: str = ""                  # TensorBoard run name (timestamp appended)
     existing_lora: Optional[dict] = None
     save_every: int = 0
     save_callback: Optional[Callable[[dict, int], None]] = None
@@ -207,6 +211,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     counts = split_counts(micro_steps, len(replicas))
     seg_frames = int(round(cfg.segment_seconds * FRAMES_PER_SECOND)) if cfg.segment_seconds > 0 else 0
     losses = []
+    monitor = TrainMonitor("acoustic", cfg.steps, cfg.log_every, cfg.tensorboard_dir or None, cfg.run_name,
+                           config={k: v for k, v in vars(cfg).items() if k not in ("existing_lora", "save_callback")})
 
     def work(replica: Replica, n_micro: int) -> torch.Tensor:
         device, dm = replica.device, replica.root.diffusion_model
@@ -246,18 +252,19 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             optimizer.zero_grad(set_to_none=True)
             loss_sum = run_on_replicas(replicas, work, counts)
             reduce_gradients(replicas)
-            if cfg.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(primary.lora.trainable, cfg.max_grad_norm)
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(primary.lora.trainable, cfg.max_grad_norm or float("inf")))
             optimizer.step()
             sync_lora_weights(replicas)
             step_loss = loss_sum / micro_steps
             losses.append(step_loss)
+            monitor.step(step + 1, step_loss, optimizer.param_groups[0]["lr"], grad_norm)
             if progress is not None:
                 progress(step + 1, cfg.steps, step_loss)
             if cfg.save_every and cfg.save_callback and (step + 1) % cfg.save_every == 0 and step + 1 < cfg.steps:
                 cfg.save_callback(primary.lora.export(), step + 1)
     finally:
         comfy.model_management.in_training = False
+        monitor.close()
         for replica in replicas:
             replica.lora.eject(replica.extra["patcher"])
         optimizer.zero_grad(set_to_none=True)
@@ -276,6 +283,7 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             "chunks": len(samples), "segment_seconds": cfg.segment_seconds, "timestep_sampling": cfg.timestep_sampling,
             "shift": cfg.shift, "learning_rate": cfg.learning_rate, "mode": cfg.mode,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
+            "tensorboard": str(monitor.log_dir) if monitor.log_dir else None,
             "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids))}
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,
                        seconds=time.perf_counter() - start_time, info=info)

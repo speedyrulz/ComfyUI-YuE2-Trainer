@@ -49,6 +49,15 @@ def _lora_choices():
     return ["[None]"] + folder_paths.get_filename_list("loras")
 
 
+def _tensorboard_dir(enabled: bool, folder: str):
+    if not enabled:
+        return ""
+    path = Path((folder or "yue2_tensorboard").strip().strip('"'))
+    if not path.is_absolute():
+        path = Path(folder_paths.get_output_directory()) / path
+    return str(path)
+
+
 def _save_checkpoint(lora_sd, name: str, steps: int, info: dict) -> str:
     target = _lora_dir() / f"{name}_{steps:06d}.safetensors"
     save_lora_file(lora_sd, target, {**info, "steps": steps, "partial": True})
@@ -313,7 +322,14 @@ def _common_training_inputs(default_lr, default_steps):
         io.Int.Input("save_every", default=0, min=0, max=100000, advanced=True,
                      tooltip="Write an intermediate LoRA to models/loras every N steps (0 = off)."),
         io.String.Input("save_name", default="yue2_lora", advanced=True,
-                        tooltip="Base name for intermediate saves."),
+                        tooltip="Base name for intermediate saves and the TensorBoard run."),
+        io.Int.Input("log_every", default=1, min=1, max=10000,
+                     tooltip="Print step / loss / lr / grad-norm / ETA to the console every N steps."),
+        io.Boolean.Input("tensorboard", default=False,
+                         tooltip="Log loss, learning rate and grad norm to TensorBoard (pip install tensorboard)."),
+        io.String.Input("tensorboard_dir", default="yue2_tensorboard", advanced=True,
+                        tooltip="TensorBoard log folder (relative paths live in ComfyUI/output). "
+                                "View with: tensorboard --logdir <folder>"),
     ]
 
 
@@ -351,7 +367,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
     def execute(cls, model, clip, dataset, segment_seconds, prefix_mode, use_semantic_tokens, train_acoustic_head,
                 timestep_sampling, shift, steps, learning_rate, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
-                existing_lora, save_every, save_name):
+                existing_lora, save_every, save_name, log_every, tensorboard, tensorboard_dir):
         cfg = AcousticConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             rank=rank, alpha=alpha, targets=targets, train_acoustic_head=train_acoustic_head,
@@ -359,6 +375,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             timestep_sampling=timestep_sampling, shift=shift, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
+            log_every=log_every, tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
         info_holder = {}
         cfg.save_callback = lambda sd, n: _save_checkpoint(sd, save_name, n, info_holder)
@@ -403,13 +420,15 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
     @classmethod
     def execute(cls, clip, dataset, train_abc, train_semantic, abc_mode, max_tokens, steps, learning_rate, rank, alpha,
                 targets, batch_size, grad_accumulation, warmup_steps, seed, optimizer, lora_dtype,
-                gradient_checkpointing, max_grad_norm, devices, existing_lora, save_every, save_name):
+                gradient_checkpointing, max_grad_norm, devices, existing_lora, save_every, save_name, log_every,
+                tensorboard, tensorboard_dir):
         cfg = PlannerConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             rank=rank, alpha=alpha, targets=targets, train_abc=train_abc, train_semantic=train_semantic,
             abc_mode=abc_mode, max_tokens=max_tokens, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
+            log_every=log_every, tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
         info_holder = {}
         cfg.save_callback = lambda sd, n: _save_checkpoint(sd, save_name, n, info_holder)
@@ -430,8 +449,10 @@ def _report(result) -> str:
     head = sum(losses[:10]) / max(1, len(losses[:10]))
     tail = sum(losses[-10:]) / max(1, len(losses[-10:]))
     lines = [f"{result.info.get('kind')} LoRA: {result.steps} steps in {result.seconds / 60:.1f} min",
-             f"loss first10={head:.4f} last10={tail:.4f} min={min(losses):.4f}" if losses else "no steps",
-             json.dumps(result.info, ensure_ascii=False)]
+             f"loss first10={head:.4f} last10={tail:.4f} min={min(losses):.4f}" if losses else "no steps"]
+    if result.info.get("tensorboard"):
+        lines.append(f"tensorboard run: {result.info['tensorboard']}")
+    lines.append(json.dumps(result.info, ensure_ascii=False))
     return "\n".join(lines)
 
 
