@@ -239,9 +239,16 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
                  sum(s.kind == "abc" for s in sequences), sum(s.kind == "semantic" for s in sequences))
     reg_sequences: list[_Sequence] = []
     if regularization is not None and regularization.items and cfg.regularization_fraction > 0:
-        reg_sequences = build_sequences(clip, regularization, cfg)
-        logging.info("YuE2 trainer: %d regularization sequences (base-model scores), drawn for %.0f%% of the micro-steps",
-                     len(reg_sequences), cfg.regularization_fraction * 100.0)
+        try:
+            reg_sequences = build_sequences(clip, regularization, cfg)
+        except ValueError:
+            logging.warning("YuE2 trainer: the regularization dataset has nothing for the enabled targets (train_abc=%s, "
+                            "train_semantic=%s: ABC scores need train_abc, semantic tokens need train_semantic); ignoring it",
+                            cfg.train_abc, cfg.train_semantic)
+        else:
+            logging.info("YuE2 trainer: %d regularization sequences (%d abc, %d semantic), drawn for %.0f%% of the micro-steps",
+                         len(reg_sequences), sum(q.kind == "abc" for q in reg_sequences),
+                         sum(q.kind == "semantic" for q in reg_sequences), cfg.regularization_fraction * 100.0)
     probe_style = cfg.probe_style.strip() or sequences[0].item.style
     probe_lyrics = cfg.probe_lyrics if cfg.probe_lyrics.strip() else sequences[0].item.lyrics
     probe_mode = cfg.probe_mode or (cfg.abc_mode if cfg.abc_mode in ("full", "melody") else "full")
