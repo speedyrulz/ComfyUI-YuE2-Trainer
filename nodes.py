@@ -19,12 +19,15 @@ from comfy_api.latest import ComfyExtension, io
 from .yue2_trainer.acoustic import LR_SCHEDULES, AcousticConfig, train_acoustic_lora
 from .yue2_trainer.audio import audio_seconds, crop_audio, encode_latents, load_audio, to_stereo_48k
 from .yue2_trainer.constants import FRAMES_PER_SECOND
-from .yue2_trainer.dataset import Dataset, Item, cache_key, load_cache, save_cache, scan_folder
+from .yue2_trainer.dataset import Dataset, Item, cache_key, clone_dataset, load_cache, save_cache, scan_folder
 from .yue2_trainer.lora import TARGET_PRESETS, load_lora_file, save_lora_file
 from .yue2_trainer.parallel import device_choices
 from .yue2_trainer.sidecars import DEFAULT_CLAUDE, PRECISIONS, SidecarConfig, WHISPER_CHOICES, prepare_folder, summarize
 from .yue2_trainer.planner import PROBE_SAMPLING, PlannerConfig, generate_abc, train_planner_lora
 from .yue2_trainer.resume import load_state, save_state, state_path
+from .yue2_trainer.semantic import DEFAULT_MERT, HEAD_FILENAME, SemanticTokenizer, tokenize_dataset
+from .yue2_trainer.semantic import summarize as summarize_semantic
+from .yue2_trainer.parallel import resolve_devices
 
 DATASET = io.Custom("YUE2_DATASET")
 LORA_MODEL = io.Custom("LORA_MODEL")
@@ -339,6 +342,56 @@ class YuE2TrainerEncodeDataset(io.ComfyNode):
             pbar.update_absolute(index + 1)
         out = Dataset(items=items, meta={**dataset.meta, "cache_dir": str(cache)})
         return io.NodeOutput(out, out.describe())
+
+
+def _head_choices():
+    names = folder_paths.get_filename_list("audio_encoders")
+    return sorted(names, key=lambda n: (HEAD_FILENAME not in n, n)) or [HEAD_FILENAME]
+
+
+class YuE2TrainerSemanticTokens(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="YuE2TrainerSemanticTokens",
+            display_name="YuE2 Semantic Tokens (community head)",
+            category=CATEGORY,
+            description="Predicts YuE2 semantic tokens for every recording with the Mothersuperior v4 tokenizer head "
+                        "(MERT-v2-FullSong layer 20 -> 32,768 codes, 25 per second) and writes <song>.semantic.npy next to "
+                        "the audio. An approximation of YuE2's unreleased tokenizer: a round trip keeps a song's rhythm and "
+                        "most of its harmony. Enables train_semantic on the planner node and use_semantic_tokens on the "
+                        "acoustic node for your own songs. Items from YuE2 output folders keep their exact tokens.",
+            inputs=[
+                DATASET.Input("dataset"),
+                io.Combo.Input("head", options=_head_choices(),
+                               tooltip=f"{HEAD_FILENAME} from huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4, "
+                                       "placed in models/audio_encoders (CC BY-NC 4.0)."),
+                io.String.Input("mert", default=DEFAULT_MERT,
+                                tooltip="MERT-v2-FullSong: a local folder with the model files, or the Hugging Face id "
+                                        "(downloaded to the HF cache on first use, about 630 MB)."),
+                io.Combo.Input("device", options=[d for d in device_choices() if d != "all"], default="auto"),
+                io.Boolean.Input("force", default=False, tooltip="Recompute even when a .semantic.npy sidecar exists."),
+                io.Boolean.Input("write_sidecars", default=True,
+                                 tooltip="Write <song>.semantic.npy next to the audio (reused by later runs and by the "
+                                         "Dataset From Folder node). Off: cache under output/yue2_trainer_cache/semantic."),
+            ],
+            outputs=[DATASET.Output("dataset", display_name="dataset"), io.String.Output("report", display_name="report")],
+        )
+
+    @classmethod
+    def execute(cls, dataset, head, mert, device, force, write_sidecars):
+        head_path = folder_paths.get_full_path_or_raise("audio_encoders", head)
+        out = clone_dataset(dataset)
+        pbar = comfy.utils.ProgressBar(max(1, sum(1 for i in out.items if i.audio_path)))
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        with torch.inference_mode(), SemanticTokenizer(head_path, mert, resolve_devices(device)[0]) as tok:
+            summary = tokenize_dataset(out, tok, force=force, write_sidecars=write_sidecars,
+                                       cache_dir=Path(folder_paths.get_output_directory()) / "yue2_trainer_cache" / "semantic",
+                                       progress=lambda done, total: pbar.update_absolute(done, total), interrupt=_interrupt)
+        report = summarize_semantic(summary) + "\n" + out.describe()
+        logging.info("YuE2 trainer: %s", summarize_semantic(summary))
+        return io.NodeOutput(out, report)
 
 
 class YuE2TrainerDatasetMerge(io.ComfyNode):
@@ -777,6 +830,7 @@ class YuE2TrainerExtension(ComfyExtension):
             YuE2TrainerPrepareDataset,
             YuE2TrainerDatasetFromAudio,
             YuE2TrainerDatasetMerge,
+            YuE2TrainerSemanticTokens,
             YuE2TrainerEncodeDataset,
             YuE2TrainerAcousticLoRA,
             YuE2TrainerPlannerLoRA,

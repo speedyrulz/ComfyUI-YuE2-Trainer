@@ -152,6 +152,11 @@ def add_common(p):
     p.add_argument("--vae-precision", default="fp32", choices=["fp32", "fp16"])
     p.add_argument("--force-reencode", action="store_true")
     p.add_argument("--transcribe", choices=["none", "melody", "full"], default="none")
+    p.add_argument("--semantic-head", default=None, metavar="FILE",
+                   help="Predict semantic tokens for every song with the Mothersuperior v4 head (name in "
+                        "models/audio_encoders or a path); writes <song>.semantic.npy sidecars.")
+    p.add_argument("--mert", default="m-a-p/MERT-v2-FullSong", help="MERT-v2-FullSong folder or Hugging Face id.")
+    p.add_argument("--semantic-force", action="store_true", help="Recompute semantic tokens even when sidecars exist.")
     p.add_argument("--sheetsage", default="sheetsage2_bf16.safetensors")
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -228,6 +233,14 @@ def main(argv=None):
     logging.info("loading %s", ckpt)
     model, clip, vae = load_checkpoint(ckpt)
     dataset = build_dataset(args)
+    if args.semantic_head:
+        from yue2_trainer.parallel import resolve_devices
+        from yue2_trainer.semantic import SemanticTokenizer, summarize, tokenize_dataset
+        head = resolve_model_file("audio_encoders", args.semantic_head)
+        device = resolve_devices(args.devices if args.devices != "all" else "auto")[0]
+        with torch.inference_mode(), SemanticTokenizer(head, args.mert, device) as tok:
+            logging.info("%s", summarize(tokenize_dataset(dataset, tok, force=args.semantic_force,
+                                                          cache_dir=Path(args.cache_dir) / "semantic")))
     logging.info("dataset:\n%s", dataset.describe())
     audio_encoder = None
     if args.transcribe != "none" and any(not item.abc for item in dataset.items):

@@ -52,8 +52,42 @@ songs/
 Files without a style sidecar use the node's `default_style`; instrumental tracks can leave lyrics empty.
 Output folders written by the native `yue2` runtime (`save_artifacts`: `request.json`, `audio.flac`,
 `score.abc`, `semantic.npy`, `latent.npy`) are picked up as-is, including their exact semantic tokens
-and latents. That is the only source of semantic tokens: the audio-to-semantic tokenizer used to train
-YuE2 is not public (see *Limitations*).
+and latents. For your own recordings the **YuE2 Semantic Tokens** node writes the `.semantic.npy` sidecar
+with a community tokenizer head (see *Semantic tokens for your own recordings*); YuE2's own audio-to-semantic
+tokenizer is not public (see *Limitations*).
+
+### Semantic tokens for your own recordings (community tokenizer, experimental)
+
+YuE2's AR stage writes *semantic tokens* (32,768 codes, 25 per second) that fix the composition, and the
+acoustic stage renders them. The encoder that turns audio into those tokens has not been released, so
+training the planner or the acoustic model on real songs normally has no semantic tokens to work with.
+[Mothersuperior's realaudio tokenizer v4](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
+is a community stand-in: an 8-layer transformer head on MERT-v2-FullSong layer-20 features, fitted on
+YuE2's own generations. **YuE2 Semantic Tokens (community head)** runs it over a dataset and writes the
+`.semantic.npy` sidecars, so afterwards `train_semantic` on the planner node and `use_semantic_tokens` on
+the acoustic node work on your own recordings. Files to download yourself (both CC BY-NC 4.0):
+`tokenizer_head_joint_v4.pt` into `models/audio_encoders`, and
+[m-a-p/MERT-v2-FullSong](https://huggingface.co/m-a-p/MERT-v2-FullSong) (a local folder for the `mert`
+input, or leave the Hugging Face id and it is fetched into the HF cache on first use, about 630 MB). The
+head's NAR companion LoRA is not needed and not used: in our test it made renders less similar to the
+original.
+
+How good is it? We measured a round trip (real 60-second excerpts -> head -> tokens -> base acoustic model,
+64 steps, shift 3, cfg 2) against the originals, frame aligned:
+
+| | chroma corr | onset corr | CLAP cos |
+|---|---|---|---|
+| Master of Puppets 1:00-2:00, round trip | 0.63 | 0.86 | 0.84 |
+| Battery 1:10-2:10, round trip | 0.57 | 0.90 | 0.78 |
+| a plain base-model generation for the same prompt | -0.02 | 0.03 | 0.55 |
+| two different real songs from the album | 0.12 | 0.05 | 0.92 |
+| a YuE2 generation, tokens re-predicted from its audio | 0.86 | 0.88 | 0.97 |
+
+Exact top-1 agreement with YuE2's true codes is only about 9-16%, but near-miss codes render almost the
+same: the round trip keeps the rhythm and most of the harmony of a real recording, far above what a
+generation from the prompt alone shares with it. Expect the timbre and vocal detail to be YuE2's, not the
+recording's. Treat sidecars from this head as approximate: when the official tokenizer ships, delete the
+`.semantic.npy` files and re-run.
 
 ### Automatic style and lyrics sidecars
 
@@ -84,6 +118,7 @@ C:/ai/ComfyUI/venv/Scripts/python.exe prepare_dataset.py D:/songs --sections cla
 | **YuE2 Prepare Dataset** | Generate missing `.style.txt` / `.lyrics.txt` sidecars (LRCLIB + Whisper, CLAP tags) and output the scanned dataset. |
 | **YuE2 Dataset From Audio** | One-item dataset from a `LoadAudio` output plus style / lyrics / ABC (chain with `append_to`). |
 | **YuE2 Merge Datasets** | Concatenate two datasets. |
+| **YuE2 Semantic Tokens (community head)** | Predict YuE2 semantic tokens for every recording with the Mothersuperior v4 head (MERT-v2-FullSong + small transformer) and write `<song>.semantic.npy`. Enables `train_semantic` / `use_semantic_tokens` on real songs. |
 | **YuE2 Encode Dataset** | VAE-encode every item to latents in fp32 (cached under `output/yue2_trainer_cache`), optionally transcribe missing ABC with a SheetSage2 `AUDIO_ENCODER`. |
 | **YuE2 Train Acoustic LoRA (MODEL)** | Flow-matching LoRA training of the acoustic model. Outputs `LORA_MODEL`, `LOSS_MAP`, steps, a text report. |
 | **YuE2 Train Planner LoRA (CLIP)** | Next-token LoRA training of the language model on ABC (and semantic tokens when present). Optional regularization input and checkpoint probes (see below). |
@@ -346,12 +381,14 @@ unit tests.
 
 ## Limitations
 
-- **No semantic-token LoRA from arbitrary audio.** YuE2's semantic tokenizer (audio → 32 768-token codec)
-  has not been released, so the semantic stage can only be trained on YuE2's own outputs (e.g. a
-  best-of-N selection of songs you liked). For real recordings the acoustic LoRA is conditioned in
-  text-only mode, which is a mode the base model was trained with (codec dropout) but not the mode used
-  at inference; expect it to transfer sound/timbre and leave composition to the (frozen or planner-LoRA)
-  AR stage — see *What an acoustic LoRA can and cannot change* above.
+- **Semantic tokens for real audio are approximate.** YuE2's semantic tokenizer (audio → 32 768-token codec)
+  has not been released. Exact tokens exist only for YuE2's own outputs; for your recordings the
+  **YuE2 Semantic Tokens** node predicts them with a community head (see *Semantic tokens for your own
+  recordings*), which keeps rhythm and most harmony but not every code, and whose argmax flips on near-ties
+  between GPUs and precisions (about 80% frame agreement between two runs). Without those sidecars the
+  acoustic LoRA is conditioned in text-only mode, which the base model was trained with (codec dropout) but
+  is not the mode used at inference; expect it to transfer sound/timbre and leave composition to the
+  (frozen or planner-LoRA) AR stage — see *What an acoustic LoRA can and cannot change* above.
 - **ABC transcription is only as good as SheetSage2.** It attends to a fixed 300-second window (about
   2 GB VRAM, roughly 20 s per 4-minute song) and can miss notes or meter; check `.abc` files you care
   about, or supply your own scores as sidecars.

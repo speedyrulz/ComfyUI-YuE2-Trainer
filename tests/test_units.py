@@ -349,3 +349,28 @@ def test_monitor_resume_eta_and_probe_lines(caplog):
     assert "best 1.4000" in text and "regularizer loss 0.9000" in text
     assert "3100 ABC tokens" in text and "HIT THE TOKEN BUDGET" in text
     assert m.probes[-1]["ended"] is False and m.drift == [(60, 0.9)]
+
+
+def test_semantic_windows_cover_every_frame_once():
+    from yue2_trainer.semantic import windows
+    for total, window in ((1, 8), (5, 8), (8, 8), (9, 8), (13, 8), (40, 8), (512, 512), (1500, 512), (12834, 512)):
+        spans = windows(total, window)
+        covered = np.zeros(total, dtype=int)
+        for start, lo, hi in spans:
+            assert 0 <= start <= max(0, total - 1) and start <= lo < hi <= min(total, start + window)
+            covered[lo:hi] += 1
+        assert covered.min() >= 1 and covered.max() <= 2, (total, window, spans)   # the appended tail window may overlap
+
+
+def test_semantic_head_predict_shapes():
+    from yue2_trainer.semantic import TokenHead, normalize, predict
+    torch.manual_seed(0)
+    head = TokenHead(width=16, layers=1, heads=2, window=8, input_dim=4, vocab=10).eval()
+    with torch.no_grad():
+        head.pos.normal_()
+    feats = np.random.RandomState(0).randn(21, 4).astype(np.float16)
+    ids = predict(head, feats)
+    assert ids.shape == (21,) and ids.dtype == np.int32 and ids.min() >= 0 and ids.max() < 10
+    assert np.array_equal(ids, predict(head, feats))
+    norm = normalize(feats)
+    assert np.allclose(norm.mean(0), 0, atol=1e-5) and np.allclose(norm.std(0), 1, atol=1e-2)

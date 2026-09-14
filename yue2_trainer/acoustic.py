@@ -233,10 +233,13 @@ def prepare_samples(clip, dataset: Dataset, cfg: AcousticConfig, progress=None) 
         cot = resolve_mode(cfg.mode, item.abc, item.has_chords())
         abc = item.abc if cot != "off" else None
         semantic = item.semantic if (cfg.use_semantic_tokens and item.semantic) else None
-        if semantic is not None and abs(len(semantic) - item.frames) > 2:
+        if semantic is not None and len(semantic) < item.frames - 2:
             logging.warning("YuE2 trainer: %s has %d semantic tokens but %d latent frames; using text-only conditioning",
                             item.id, len(semantic), item.frames)
             semantic = None
+        elif semantic is not None and len(semantic) > item.frames + 2:
+            logging.info("YuE2 trainer: %s has %d semantic tokens for %d latent frames; using the first %d "
+                         "(the audio was cropped from the start)", item.id, len(semantic), item.frames, item.frames)
         if semantic is not None:
             n = min(len(semantic), item.frames)
             prefix_ids, _ = music_prefix_ids(clip, item.style, item.lyrics, abc, cot)
