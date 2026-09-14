@@ -136,8 +136,12 @@ or use *Load*; recent frontends import API-format JSON):
 - `yue2_train_acoustic_lora_api.json` – checkpoint → dataset → encode → acoustic LoRA → save + loss plot
 - `yue2_prepare_and_train_acoustic_api.json` – same, but **Prepare Dataset** generates the style/lyrics sidecars first
 - `yue2_train_planner_lora_api.json` – same with SheetSage2 transcription (`full`, with chords) → planner LoRA,
-  100 steps at `5e-5` with a checkpoint and a probe score every 25 steps (add a **YuE2 Regularization Scores**
-  node on the base CLIP and connect it to `regularization` to keep the planner from over-training)
+  100 steps at `5e-5` with a checkpoint and a probe score every 10 steps and a **YuE2 Regularization Scores**
+  node (base scores for the dataset's own prompts) on the `regularization` input
+- `yue2_train_semantic_planner_api.json` – the planner graph with **YuE2 Semantic Tokens** between encoding and
+  training and both targets on (`train_abc` + `train_semantic`, rank 32, checkpoints and probes every 10
+  steps, regularization scores at 0.3); needs the community tokenizer head (see *Semantic tokens for your
+  own recordings*)
 - `yue2_generate_with_lora_api.json` – the stock YuE2 generation graph with **YuE2 Load LoRA** between the
   checkpoint loader and the YuE2 nodes
 

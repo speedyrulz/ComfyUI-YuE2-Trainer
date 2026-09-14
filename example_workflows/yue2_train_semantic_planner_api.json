@@ -51,20 +51,20 @@
     1
    ],
    "dataset": [
-    "3",
+    "10",
     0
    ],
    "train_abc": true,
-   "train_semantic": false,
+   "train_semantic": true,
    "abc_mode": "full",
    "max_tokens": 4096,
    "steps": 100,
    "learning_rate": 5e-05,
-   "rank": 16,
-   "alpha": 16.0,
+   "rank": 32,
+   "alpha": 32.0,
    "targets": "attention+mlp",
    "batch_size": 1,
-   "grad_accumulation": 1,
+   "grad_accumulation": 2,
    "warmup_steps": 10,
    "seed": 0,
    "optimizer": "AdamW",
@@ -73,7 +73,7 @@
    "max_grad_norm": 1.0,
    "existing_lora": "[None]",
    "save_every": 10,
-   "save_name": "yue2_planner",
+   "save_name": "yue2_semantic_planner",
    "devices": "auto",
    "log_every": 1,
    "tensorboard": false,
@@ -83,7 +83,7 @@
    "eval_samples": 8,
    "eval_holdout": 1,
    "resume_state": true,
-   "regularization_fraction": 0.5,
+   "regularization_fraction": 0.3,
    "probe_every": 10,
    "probe_style": "",
    "probe_lyrics": "",
@@ -117,7 +117,7 @@
     "4",
     1
    ],
-   "filename_prefix": "yue2_planner_loss"
+   "filename_prefix": "yue2_semantic_planner_loss"
   }
  },
  "7": {
@@ -167,6 +167,29 @@
   "inputs": {
    "source": [
     "11",
+    1
+   ]
+  }
+ },
+ "10": {
+  "class_type": "YuE2TrainerSemanticTokens",
+  "inputs": {
+   "dataset": [
+    "3",
+    0
+   ],
+   "head": "tokenizer_head_joint_v4.pt",
+   "mert": "m-a-p/MERT-v2-FullSong",
+   "device": "auto",
+   "force": false,
+   "write_sidecars": true
+  }
+ },
+ "12": {
+  "class_type": "PreviewAny",
+  "inputs": {
+   "source": [
+    "10",
     1
    ]
   }
