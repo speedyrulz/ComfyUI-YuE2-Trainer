@@ -28,8 +28,9 @@ class TrainMonitor:
     """
 
     def __init__(self, kind: str, total_steps: int, log_every: int = 1, tensorboard_dir: Optional[str] = None,
-                 run_name: str = "", config: Optional[dict] = None, window: int = 20):
+                 run_name: str = "", config: Optional[dict] = None, window: int = 20, eval_label: str = "fixed-set"):
         self.kind = kind
+        self.eval_label = eval_label
         self.total = total_steps
         self.log_every = max(1, int(log_every))
         self.window = window
@@ -78,11 +79,12 @@ class TrainMonitor:
         """Fixed-set validation loss at step ``index`` (0 = before training)."""
         self.evals.append((index, loss))
         if self.writer is not None:
-            self.writer.add_scalar("loss/eval_fixed", loss, index)
+            self.writer.add_scalar("loss/eval_heldout" if self.eval_label == "held-out" else "loss/eval_fixed", loss, index)
         start = self.evals[0][1]
         best = min(v for _, v in self.evals)
-        LOG.info("YuE2 %s eval step %d/%d  fixed-set loss %.4f  (start %.4f, best %.4f, change %+.1f%%)",
-                 self.kind, index, self.total, loss, start, best, (loss / start - 1.0) * 100.0 if start else 0.0)
+        LOG.info("YuE2 %s eval step %d/%d  %s loss %.4f  (start %.4f, best %.4f, change %+.1f%%)",
+                 self.kind, index, self.total, self.eval_label, loss, start, best,
+                 (loss / start - 1.0) * 100.0 if start else 0.0)
 
     def close(self, info: Optional[dict] = None):
         if self.writer is not None:
@@ -96,8 +98,8 @@ class TrainMonitor:
                      len(self.losses), _fmt_seconds(time.perf_counter() - self.start),
                      self.losses[0], self.losses[-1], min(self.losses))
         if len(self.evals) > 1:
-            LOG.info("YuE2 %s fixed-set loss: %.4f before training -> %.4f at the end (best %.4f at step %d)", self.kind,
-                     self.evals[0][1], self.evals[-1][1], min(v for _, v in self.evals),
+            LOG.info("YuE2 %s %s loss: %.4f before training -> %.4f at the end (best %.4f at step %d)", self.kind,
+                     self.eval_label, self.evals[0][1], self.evals[-1][1], min(v for _, v in self.evals),
                      min(self.evals, key=lambda e: e[1])[0])
 
 

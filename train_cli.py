@@ -169,6 +169,8 @@ def add_common(p):
     p.add_argument("--eval-every", type=int, default=50,
                    help="Score a fixed evaluation set (same crops/sigmas/noise) every N steps and before step 1; 0 = off.")
     p.add_argument("--eval-samples", type=int, default=8, help="Size of the fixed evaluation set.")
+    p.add_argument("--eval-holdout", type=int, default=1,
+                   help="Songs kept out of training for the evaluation set (0 = score training crops).")
     p.add_argument("--tensorboard", default=None, metavar="DIR",
                    help="Log loss/lr/grad-norm to TensorBoard under DIR (tensorboard --logdir DIR).")
     p.add_argument("--run-name", default="", help="TensorBoard run name (default: output name).")
@@ -250,6 +252,7 @@ def main(argv=None):
                                  gradient_checkpointing=not args.no_checkpointing, optimizer=args.optimizer,
                                  devices=args.devices, existing_lora=existing,
                                  log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
+                                 eval_holdout=args.eval_holdout,
                                  tensorboard_dir=args.tensorboard or "",
                                  run_name=args.run_name or Path(args.out).stem, save_every=args.save_every, save_callback=save_partial)
             result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress)
@@ -262,6 +265,7 @@ def main(argv=None):
                                 lora_dtype=args.lora_dtype, gradient_checkpointing=not args.no_checkpointing,
                                 optimizer=args.optimizer, devices=args.devices, existing_lora=existing,
                                 log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
+                                eval_holdout=args.eval_holdout,
                                 tensorboard_dir=args.tensorboard or "",
                                 run_name=args.run_name or Path(args.out).stem,
                                 save_every=args.save_every, save_callback=save_partial)

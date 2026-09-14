@@ -80,7 +80,8 @@
    "tensorboard_dir": "yue2_tensorboard",
    "lr_schedule": "cosine",
    "eval_every": 50,
-   "eval_samples": 8
+   "eval_samples": 8,
+   "eval_holdout": 1
   }
  },
  "5": {

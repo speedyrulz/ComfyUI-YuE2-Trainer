@@ -264,3 +264,14 @@ def test_planner_crop_windows_cover_start_and_end():
     assert heads > 50 and tails > 50 and mids > 30
     short = _Sequence(item=None, kind="abc", ids=list(range(50)), loss_start=5)
     assert _crop(short, 1024, rng) == (list(range(50)), 5)
+
+
+def test_split_holdout_is_deterministic_and_guarded():
+    from yue2_trainer.acoustic import split_holdout
+    ids = [f"song{i}" for i in range(8)] * 3            # several chunks per song
+    held = split_holdout(ids, 1, seed=5)
+    assert len(held) == 1 and held == split_holdout(ids, 1, seed=5) and held <= set(ids)
+    assert len(split_holdout(ids, 3, seed=5)) == 3
+    assert len(split_holdout(ids, 10, seed=5)) == 5     # never more than items - 3
+    assert split_holdout(["a", "b", "c"], 1, seed=0) == set()
+    assert split_holdout(ids, 0, seed=0) == set()

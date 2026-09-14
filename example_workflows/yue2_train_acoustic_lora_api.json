@@ -78,7 +78,8 @@
    "caption_dropout": 0.1,
    "conditioning": "compact",
    "eval_every": 50,
-   "eval_samples": 8
+   "eval_samples": 8,
+   "eval_holdout": 1
   }
  },
  "5": {

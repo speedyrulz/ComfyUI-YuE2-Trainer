@@ -9,7 +9,7 @@ from typing import Callable, Optional
 
 import torch
 
-from .acoustic import TrainResult, _check_trainable_weights, _make_optimizer, _lr_at
+from .acoustic import TrainResult, _check_trainable_weights, _make_optimizer, _lr_at, split_holdout
 from .constants import CLIP_KEY_PREFIX, CODEC_OFFSET, CONTEXT, MUSIC_END
 from .dataset import Dataset, Item
 from .forward import ar_hidden, chunked_cross_entropy
@@ -45,6 +45,7 @@ class PlannerConfig:
     log_every: int = 1                  # console line every N steps
     eval_every: int = 50                # fixed-crop validation loss every N steps (0 = off)
     eval_samples: int = 8               # size of the fixed evaluation set
+    eval_holdout: int = 1               # songs kept out of training and used for the evaluation set (0 = score training crops)
     tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
     run_name: str = ""                  # TensorBoard run name (timestamp appended)
     existing_lora: Optional[dict] = None
@@ -177,6 +178,13 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
     torch.manual_seed(cfg.seed)
     devices = resolve_devices(cfg.devices)
     sequences = build_sequences(clip, dataset, cfg)
+    held = split_holdout([s.item.id for s in sequences], cfg.eval_holdout, cfg.seed) if cfg.eval_every > 0 else set()
+    eval_pool = [s for s in sequences if s.item.id in held] if held else sequences
+    if held:
+        sequences = [s for s in sequences if s.item.id not in held]
+        logging.info("YuE2 trainer: held out for evaluation (not trained on): %s", ", ".join(sorted(held)))
+    elif cfg.eval_holdout > 0 and cfg.eval_every > 0:
+        logging.warning("YuE2 trainer: too few items to hold one out for evaluation; scoring training crops instead")
     logging.info("YuE2 trainer: %d planner sequences (%d abc, %d semantic)", len(sequences),
                  sum(s.kind == "abc" for s in sequences), sum(s.kind == "semantic" for s in sequences))
 
@@ -196,16 +204,18 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
                         "raise it to keep every GPU busy", micro_steps, len(devices))
     counts = split_counts(micro_steps, len(replicas))
     losses = []
-    eval_set = build_eval_set(sequences, cfg, cfg.seed)
+    eval_set = build_eval_set(eval_pool, cfg, cfg.seed)
     evals: list[list] = []
     info = {"kind": "planner", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets, "steps": cfg.steps,
             "eval_every": cfg.eval_every if eval_set else 0, "eval_samples": len(eval_set), "eval": evals,
+            "eval_holdout": sorted(held),
             "sequences": len(sequences), "train_abc": cfg.train_abc, "train_semantic": cfg.train_semantic,
             "max_tokens": cfg.max_tokens, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
             }
     monitor = TrainMonitor("planner", cfg.steps, cfg.log_every, cfg.tensorboard_dir or None, cfg.run_name,
-                           config={k: v for k, v in vars(cfg).items() if k not in ("existing_lora", "save_callback")})
+                           config={k: v for k, v in vars(cfg).items() if k not in ("existing_lora", "save_callback")},
+                           eval_label="held-out" if held else "fixed-set")
 
     def work_fn(replica: Replica, n_micro: int) -> torch.Tensor:
         device, llm = replica.device, replica.root.model

@@ -138,10 +138,12 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   `1e-4` here moves the weights roughly as much as `8e-4` would in a PEFT-style trainer (about 6% of the
   weight norm after 1000 steps at rank 32); do not copy a higher learning rate from other trainers.
 - `save_every` writes `models/loras/<save_name>_<steps>.safetensors` checkpoints; `existing_lora` resumes.
-- `eval_every` (50) / `eval_samples` (8): score a fixed evaluation set before step 1 and every N steps. The set
-  is drawn once from the training data (fixed crops; for the acoustic trainer also fixed sigmas, stratified
-  over the sigma distribution, and fixed noise), so the number only moves when the LoRA does. It measures
-  fit to the training songs, not generalisation; see *Watching a run*.
+- `eval_every` (50) / `eval_samples` (8) / `eval_holdout` (1): score a fixed evaluation set before step 1 and
+  every N steps. By default one song is held out of training and the set is drawn from it (fixed crops; for
+  the acoustic trainer also fixed sigmas, stratified over the sigma distribution, and fixed noise), so the
+  number only moves when the LoRA does and it measures how the LoRA handles a song it has not seen. With
+  `eval_holdout` 0 every song trains and the set is drawn from the training songs instead, which measures
+  fit only. Never more than `items - 3` songs are held out. See *Watching a run*.
 
 **Planner LoRA**
 
@@ -211,11 +213,15 @@ keeps changing. The fixed-set evaluation line is the one to watch:
 YuE2 acoustic eval step 200/1000  fixed-set loss 0.9127  (start 1.0418, best 0.9127, change -12.4%)
 ```
 
-Because the crops, sigmas and noise never change, differences of a few thousandths are real. Read it as
-follows: still falling = still learning; flat for several evaluations = done (stop, or lower the learning
-rate); rising after a minimum = over-training (use the checkpoint from the best step, `save_every` helps).
-For the planner the same line reports cross-entropy on fixed score crops; a value that keeps dropping
-toward 0.1 nats means the scores are being memorised.
+Because the crops, sigmas and noise never change, differences of a few thousandths are real. With the
+default `eval_holdout` of 1 the line says `held-out loss` and is scored on a song the LoRA never trains on,
+which is the signal you want: still falling = still learning something that transfers; flat for several
+evaluations = done; rising after a minimum = over-training, so use the checkpoint from the best step
+(`save_every` 10-25 for the planner, 250 for the acoustic trainer). A loss on *training* crops
+(`eval_holdout` 0, label `fixed-set`) keeps falling while the planner memorises the scores and stops
+generating properly, so it cannot tell you when to stop; use it only to confirm that training is moving at
+all. For the planner the held-out cross-entropy typically bottoms out after a few dozen steps on a small
+album; the acoustic held-out loss moves by hundredths over a thousand steps.
 
 Turn on `tensorboard` to also log `loss/step`, `loss/avg20`, `loss/eval_fixed`, `lr` and `grad_norm` per
 step, plus the run configuration and final result as text. Runs land in `ComfyUI/output/yue2_tensorboard/<save_name>_<timestamp>`

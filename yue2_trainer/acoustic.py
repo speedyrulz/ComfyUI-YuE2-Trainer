@@ -54,6 +54,7 @@ class AcousticConfig:
     log_every: int = 1                  # console line every N steps
     eval_every: int = 50                # fixed-noise validation loss every N steps (0 = off)
     eval_samples: int = 8               # size of the fixed evaluation set
+    eval_holdout: int = 1               # songs kept out of training and used for the evaluation set (0 = score training crops)
     tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
     run_name: str = ""                  # TensorBoard run name (timestamp appended)
     existing_lora: Optional[dict] = None
@@ -94,6 +95,20 @@ def _sigma_quantile(cfg: AcousticConfig, q: float) -> float:
     else:
         u = q
     return _shift_sigma(cfg, u)
+
+
+def split_holdout(item_ids: list, holdout: int, seed: int) -> set:
+    """Deterministic set of item ids to keep out of training for the evaluation set.
+
+    Never holds out more than ``items - 3`` so that a small dataset keeps enough songs to train on;
+    with three items or fewer nothing is held out.
+    """
+    unique = sorted(set(item_ids))
+    n = min(int(holdout), max(0, len(unique) - 3)) if holdout > 0 else 0
+    if n <= 0:
+        return set()
+    rng = random.Random(seed + 4242)
+    return set(rng.sample(unique, n))
 
 
 @dataclass
@@ -323,7 +338,14 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
 
     # 1. AR prefix caches via CLIP (then free it to make room for the acoustic model).
     samples = prepare_samples(clip, dataset, cfg)
-    logging.info("YuE2 trainer: %d training chunks from %d items", len(samples), len(dataset.with_latents()))
+    held = split_holdout([s.item.id for s in samples], cfg.eval_holdout, cfg.seed) if cfg.eval_every > 0 else set()
+    eval_pool = [s for s in samples if s.item.id in held] if held else samples
+    if held:
+        samples = [s for s in samples if s.item.id not in held]
+        logging.info("YuE2 trainer: held out for evaluation (not trained on): %s", ", ".join(sorted(held)))
+    elif cfg.eval_holdout > 0 and cfg.eval_every > 0:
+        logging.warning("YuE2 trainer: too few items to hold one out for evaluation; scoring training crops instead")
+    logging.info("YuE2 trainer: %d training chunks from %d items", len(samples), len({s.item.id for s in samples}))
     comfy.model_management.unload_all_models()
     comfy.model_management.soft_empty_cache()
 
@@ -344,11 +366,12 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     counts = split_counts(micro_steps, len(replicas))
     seg_frames = int(round(cfg.segment_seconds * FRAMES_PER_SECOND)) if cfg.segment_seconds > 0 else 0
     losses = []
-    eval_set = build_eval_set([s.chunk for s in samples], cfg, seg_frames, cfg.seed)
+    eval_set = build_eval_set([s.chunk for s in eval_pool], cfg, seg_frames, cfg.seed)
     evals: list[list] = []
     info = {"kind": "acoustic", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets,
             "eval_every": cfg.eval_every if eval_set else 0, "eval_samples": len(eval_set), "eval": evals,
-            "train_acoustic_head": cfg.train_acoustic_head, "steps": cfg.steps, "items": len(dataset.with_latents()),
+            "eval_holdout": sorted(held),
+            "train_acoustic_head": cfg.train_acoustic_head, "steps": cfg.steps, "items": len({s.item.id for s in samples}),
             "chunks": len(samples), "segment_seconds": cfg.segment_seconds, "timestep_sampling": cfg.timestep_sampling,
             "shift": cfg.shift, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule, "mode": cfg.mode,
             "caption_dropout": cfg.caption_dropout, "conditioning": cfg.conditioning,
@@ -356,7 +379,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids))}
 
     monitor = TrainMonitor("acoustic", cfg.steps, cfg.log_every, cfg.tensorboard_dir or None, cfg.run_name,
-                           config={k: v for k, v in vars(cfg).items() if k not in ("existing_lora", "save_callback")})
+                           config={k: v for k, v in vars(cfg).items() if k not in ("existing_lora", "save_callback")},
+                           eval_label="held-out" if held else "fixed-set")
 
     def work(replica: Replica, n_micro: int) -> torch.Tensor:
         device, dm = replica.device, replica.root.diffusion_model
@@ -392,7 +416,7 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
         return total
 
     def run_eval(index: int):
-        value = _evaluate(primary, samples, eval_set, cfg)
+        value = _evaluate(primary, eval_pool, eval_set, cfg)
         evals.append([index, value])
         monitor.eval(index, value)
 
@@ -443,4 +467,4 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
                        seconds=time.perf_counter() - start_time, info=info, evals=evals)
 
 
-__all__ = ["AcousticConfig", "TrainResult", "train_acoustic_lora", "prepare_samples", "build_eval_set"]
+__all__ = ["AcousticConfig", "TrainResult", "train_acoustic_lora", "prepare_samples", "build_eval_set", "split_holdout"]

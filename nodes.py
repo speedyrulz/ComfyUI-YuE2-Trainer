@@ -362,6 +362,11 @@ def _common_training_inputs(default_lr, default_steps):
                              "0 = off."),
         io.Int.Input("eval_samples", default=8, min=1, max=256, advanced=True,
                      tooltip="Size of the fixed evaluation set (forward passes per evaluation)."),
+        io.Int.Input("eval_holdout", default=1, min=0, max=64,
+                     tooltip="Songs kept OUT of training and used for the evaluation set. A held-out loss that stops "
+                             "falling or rises means the LoRA is over-training; the loss on training songs keeps "
+                             "falling while it memorises them. 0 scores training crops instead (all songs train). "
+                             "Never more than items - 3 are held out."),
         io.Boolean.Input("tensorboard", default=False,
                          tooltip="Log loss, learning rate and grad norm to TensorBoard (pip install tensorboard)."),
         io.String.Input("tensorboard_dir", default="yue2_tensorboard", advanced=True,
@@ -415,7 +420,8 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
     def execute(cls, model, clip, dataset, segment_seconds, conditioning, prefix_mode, use_semantic_tokens, train_acoustic_head,
                 caption_dropout, timestep_sampling, shift, steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
-                existing_lora, save_every, save_name, log_every, eval_every, eval_samples, tensorboard, tensorboard_dir):
+                existing_lora, save_every, save_name, log_every, eval_every, eval_samples, eval_holdout, tensorboard,
+                tensorboard_dir):
         cfg = AcousticConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             lr_schedule=lr_schedule,
@@ -426,7 +432,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             timestep_sampling=timestep_sampling, shift=shift, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
-            log_every=log_every, eval_every=eval_every, eval_samples=eval_samples,
+            log_every=log_every, eval_every=eval_every, eval_samples=eval_samples, eval_holdout=eval_holdout,
             tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
         cfg.save_callback = lambda sd, n, info: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name})
@@ -476,7 +482,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
                 rank, alpha,
                 targets, batch_size, grad_accumulation, warmup_steps, seed, optimizer, lora_dtype,
                 gradient_checkpointing, max_grad_norm, devices, existing_lora, save_every, save_name, log_every, eval_every, eval_samples,
-                tensorboard, tensorboard_dir):
+                eval_holdout, tensorboard, tensorboard_dir):
         cfg = PlannerConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             lr_schedule=lr_schedule,
@@ -484,7 +490,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
             abc_mode=abc_mode, max_tokens=max_tokens, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
-            log_every=log_every, eval_every=eval_every, eval_samples=eval_samples,
+            log_every=log_every, eval_every=eval_every, eval_samples=eval_samples, eval_holdout=eval_holdout,
             tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
         cfg.save_callback = lambda sd, n, info: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name})
