@@ -58,8 +58,8 @@
    "train_semantic": false,
    "abc_mode": "full",
    "max_tokens": 4096,
-   "steps": 300,
-   "learning_rate": 0.0001,
+   "steps": 100,
+   "learning_rate": 5e-05,
    "rank": 16,
    "alpha": 16.0,
    "targets": "attention+mlp",
@@ -72,7 +72,7 @@
    "gradient_checkpointing": true,
    "max_grad_norm": 1.0,
    "existing_lora": "[None]",
-   "save_every": 50,
+   "save_every": 25,
    "save_name": "yue2_planner",
    "devices": "auto",
    "log_every": 1,
@@ -81,7 +81,14 @@
    "lr_schedule": "cosine",
    "eval_every": 50,
    "eval_samples": 8,
-   "eval_holdout": 1
+   "eval_holdout": 1,
+   "resume_state": true,
+   "regularization_fraction": 0.5,
+   "probe_every": 25,
+   "probe_style": "",
+   "probe_lyrics": "",
+   "probe_max_tokens": 8192,
+   "probe_seed": 0
   }
  },
  "5": {

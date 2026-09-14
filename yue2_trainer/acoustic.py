@@ -21,6 +21,7 @@ from .parallel import (Replica, clone_patcher_for_device, free_replicas, reduce_
 from .constants import MUSIC_END
 from .prefix import (PrefixCache, build_acoustic_prefix, compute_prefix_kv, load_clip_for_prefill, music_prefix_ids,
                      negative_prefix_ids, resolve_mode)
+from .resume import capture_state, restore_state
 
 
 @dataclass
@@ -58,8 +59,9 @@ class AcousticConfig:
     tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
     run_name: str = ""                  # TensorBoard run name (timestamp appended)
     existing_lora: Optional[dict] = None
+    resume_state: Optional[dict] = None   # optimizer / RNG / step state saved next to existing_lora
     save_every: int = 0
-    save_callback: Optional[Callable[[dict, int], None]] = None
+    save_callback: Optional[Callable] = None   # (lora_sd, step, info, state)
 
 
 @dataclass
@@ -70,6 +72,7 @@ class TrainResult:
     seconds: float = 0.0
     info: dict = field(default_factory=dict)
     evals: list = field(default_factory=list)   # [[step, fixed-noise loss], ...]
+    state: Optional[dict] = None                # resumable optimizer / RNG / step state at the end of the run
 
 
 def _shift_sigma(cfg: AcousticConfig, u: float) -> float:
@@ -365,12 +368,21 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
                         "raise it to keep every GPU busy", micro_steps, len(devices))
     counts = split_counts(micro_steps, len(replicas))
     seg_frames = int(round(cfg.segment_seconds * FRAMES_PER_SECOND)) if cfg.segment_seconds > 0 else 0
-    losses = []
     eval_set = build_eval_set([s.chunk for s in eval_pool], cfg, seg_frames, cfg.seed)
+    losses: list[float] = []
     evals: list[list] = []
+    start_step = 0
+    restored = restore_state(cfg.resume_state, "acoustic", cfg, optimizer, replicas) if cfg.resume_state else None
+    if restored:
+        start_step = int(restored["step"])
+        losses, evals = list(restored["losses"]), [list(e) for e in restored["evals"]]
+        if start_step >= cfg.steps:
+            raise ValueError(f"The resumed run is already at step {start_step}; set steps above it to continue "
+                             "(or turn resume_state off to start a new run from the LoRA weights)")
+        logging.info("YuE2 trainer: resuming at step %d of %d (optimizer and random state restored)", start_step, cfg.steps)
     info = {"kind": "acoustic", "rank": cfg.rank, "alpha": cfg.alpha, "targets": cfg.targets,
             "eval_every": cfg.eval_every if eval_set else 0, "eval_samples": len(eval_set), "eval": evals,
-            "eval_holdout": sorted(held),
+            "eval_holdout": sorted(held), "resumed_from": start_step,
             "train_acoustic_head": cfg.train_acoustic_head, "steps": cfg.steps, "items": len({s.item.id for s in samples}),
             "chunks": len(samples), "segment_seconds": cfg.segment_seconds, "timestep_sampling": cfg.timestep_sampling,
             "shift": cfg.shift, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule, "mode": cfg.mode,
@@ -379,8 +391,11 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids))}
 
     monitor = TrainMonitor("acoustic", cfg.steps, cfg.log_every, cfg.tensorboard_dir or None, cfg.run_name,
-                           config={k: v for k, v in vars(cfg).items() if k not in ("existing_lora", "save_callback")},
-                           eval_label="held-out" if held else "fixed-set")
+                           config={k: v for k, v in vars(cfg).items()
+                                   if k not in ("existing_lora", "save_callback", "resume_state")},
+                           eval_label="held-out" if held else "fixed-set", start_step=start_step)
+    monitor.evals = [tuple(e) for e in evals]
+    monitor.losses = list(losses)
 
     def work(replica: Replica, n_micro: int) -> torch.Tensor:
         device, dm = replica.device, replica.root.diffusion_model
@@ -420,10 +435,14 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
         evals.append([index, value])
         monitor.eval(index, value)
 
+    def state_at(step: int) -> dict:
+        return capture_state("acoustic", cfg, step, optimizer, replicas, losses, evals)
+
+    final_state = None
     try:
-        if eval_set:
-            run_eval(0)
-        for step in range(cfg.steps):
+        if eval_set and not (evals and evals[-1][0] == start_step):
+            run_eval(start_step)
+        for step in range(start_step, cfg.steps):
             if interrupt_check is not None:
                 interrupt_check()
             for group in optimizer.param_groups:
@@ -443,7 +462,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
                 progress(step + 1, cfg.steps, step_loss)
             if cfg.save_every and cfg.save_callback and (step + 1) % cfg.save_every == 0 and step + 1 < cfg.steps:
                 cfg.save_callback(primary.lora.export(), step + 1,
-                                  {**info, "steps": step + 1, "partial": True, "loss": step_loss})
+                                  {**info, "steps": step + 1, "partial": True, "loss": step_loss}, state_at(step + 1))
+        final_state = state_at(cfg.steps)
     finally:
         comfy.model_management.in_training = False
         monitor.close()
@@ -464,7 +484,7 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     if evals:
         info["eval_loss_start"], info["eval_loss_final"] = evals[0][1], evals[-1][1]
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,
-                       seconds=time.perf_counter() - start_time, info=info, evals=evals)
+                       seconds=time.perf_counter() - start_time, info=info, evals=evals, state=final_state)
 
 
 __all__ = ["AcousticConfig", "TrainResult", "train_acoustic_lora", "prepare_samples", "build_eval_set", "split_holdout"]

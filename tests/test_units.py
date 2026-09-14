@@ -275,3 +275,77 @@ def test_split_holdout_is_deterministic_and_guarded():
     assert len(split_holdout(ids, 10, seed=5)) == 5     # never more than items - 3
     assert split_holdout(["a", "b", "c"], 1, seed=0) == set()
     assert split_holdout(ids, 0, seed=0) == set()
+
+
+def test_pick_sequence_mixes_regularization_at_fraction():
+    import random
+    from yue2_trainer.planner import pick_sequence
+    rng = random.Random(0)
+    train, reg = ["song"] * 3, ["reg"] * 2
+    draws = [pick_sequence(rng, train, reg, 0.5) for _ in range(2000)]
+    share = draws.count("reg") / len(draws)
+    assert 0.45 < share < 0.55
+    assert all(pick_sequence(rng, train, reg, 0.0) == "song" for _ in range(50))
+    assert all(pick_sequence(rng, train, [], 0.9) == "song" for _ in range(50))
+
+
+def test_resume_state_roundtrip(tmp_path):
+    import random
+    from types import SimpleNamespace
+    from yue2_trainer.parallel import Replica
+    from yue2_trainer.resume import capture_state, load_state, restore_state, save_state, state_path
+
+    def make():
+        params = [nn.Parameter(torch.zeros(3, 2)), nn.Parameter(torch.ones(2))]
+        opt = torch.optim.AdamW(params, lr=1e-3)
+        reps = [Replica(index=0, device=torch.device("cpu"), root=None, generator=torch.Generator().manual_seed(5),
+                        extra={"py_rng": random.Random(7)})]
+        return params, opt, reps
+
+    cfg = SimpleNamespace(rank=8, alpha=8.0, targets="attention", optimizer="AdamW")
+    params, opt, reps = make()
+    for _ in range(3):                                  # give the optimizer some moments
+        opt.zero_grad()
+        (params[0].sum() + params[1].sum()).backward()
+        opt.step()
+    reps[0].extra["py_rng"].random()
+    torch.rand(1, generator=reps[0].generator)
+    state = capture_state("planner", cfg, 3, opt, reps, [1.0, 0.5, 0.25], [[0, 2.0], [3, 1.5]], extra={"probes": [{"step": 0}]})
+    path = state_path(tmp_path / "lora_000003.safetensors")
+    assert path.name == "lora_000003.resume"
+    save_state(state, path)
+    loaded = load_state(path)
+    assert loaded["step"] == 3 and loaded["losses"] == [1.0, 0.5, 0.25] and loaded["probes"] == [{"step": 0}]
+
+    expect_py, expect_t = reps[0].extra["py_rng"].random(), torch.rand(1, generator=reps[0].generator)
+    params2, opt2, reps2 = make()
+    assert restore_state(loaded, "planner", cfg, opt2, reps2) is loaded
+    assert reps2[0].extra["py_rng"].random() == expect_py
+    assert torch.equal(torch.rand(1, generator=reps2[0].generator), expect_t)
+    a, b = opt.state_dict()["state"], opt2.state_dict()["state"]
+    assert all(torch.equal(a[i][k], b[i][k]) for i in a for k in ("exp_avg", "exp_avg_sq"))
+
+    # wrong trainer / changed configuration / mismatched optimizer -> start fresh (None), never raise
+    assert restore_state(loaded, "acoustic", cfg, opt2, reps2) is None
+    other = SimpleNamespace(rank=16, alpha=8.0, targets="attention", optimizer="AdamW")
+    assert restore_state(loaded, "planner", other, opt2, reps2) is None
+    opt3 = torch.optim.AdamW([nn.Parameter(torch.zeros(4))], lr=1e-3)
+    assert restore_state(loaded, "planner", cfg, opt3, reps2) is None
+    assert load_state(tmp_path / "missing.resume") is None
+
+
+def test_monitor_resume_eta_and_probe_lines(caplog):
+    import logging
+    from yue2_trainer.monitor import TrainMonitor
+    m = TrainMonitor("planner", total_steps=100, log_every=1, start_step=50)
+    m.evals = [(0, 2.0), (50, 1.5)]
+    with caplog.at_level(logging.INFO, logger="yue2_trainer"):
+        m.step(51, 1.0, 1e-4, 0.5)
+        m.eval(60, 1.4, drift=0.9)
+        m.probe(60, 3100, True, 12.0, path="x/step_000060.abc")
+        m.probe(80, 8192, False, 30.0)
+    text = caplog.text
+    assert "step 51/100" in text and "eta" in text
+    assert "best 1.4000" in text and "regularizer loss 0.9000" in text
+    assert "3100 ABC tokens" in text and "HIT THE TOKEN BUDGET" in text
+    assert m.probes[-1]["ended"] is False and m.drift == [(60, 0.9)]

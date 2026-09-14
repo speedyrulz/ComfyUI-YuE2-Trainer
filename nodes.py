@@ -23,7 +23,8 @@ from .yue2_trainer.dataset import Dataset, Item, cache_key, load_cache, save_cac
 from .yue2_trainer.lora import TARGET_PRESETS, load_lora_file, save_lora_file
 from .yue2_trainer.parallel import device_choices
 from .yue2_trainer.sidecars import DEFAULT_CLAUDE, PRECISIONS, SidecarConfig, WHISPER_CHOICES, prepare_folder, summarize
-from .yue2_trainer.planner import PlannerConfig, train_planner_lora
+from .yue2_trainer.planner import PROBE_SAMPLING, PlannerConfig, generate_abc, train_planner_lora
+from .yue2_trainer.resume import load_state, save_state, state_path
 
 DATASET = io.Custom("YUE2_DATASET")
 LORA_MODEL = io.Custom("LORA_MODEL")
@@ -45,6 +46,36 @@ def _existing_lora(name: str):
     return load_lora_file(folder_paths.get_full_path_or_raise("loras", name))
 
 
+def _resume_state(name: str, enabled: bool):
+    """The ``.resume`` file written next to ``name`` by save_every / YuE2 Save LoRA, if any."""
+    if not enabled or not name or name == "[None]":
+        return None
+    path = state_path(folder_paths.get_full_path_or_raise("loras", name))
+    state = load_state(path)
+    if state is None:
+        logging.info("YuE2 trainer: no resume state next to %s; continuing from its weights with a fresh optimizer", name)
+    return state
+
+
+def _probe_dir(save_name: str) -> Path:
+    safe = "".join(c for c in save_name.strip() if c not in '\\/:*?"<>|') or "yue2_lora"
+    return Path(folder_paths.get_output_directory()) / "yue2_probes" / safe
+
+
+def _probe_writer(save_name: str):
+    """Saves every probe score as output/yue2_probes/<save_name>/step_000025.abc (+ .json with its metadata)."""
+    folder = _probe_dir(save_name)
+
+    def write(step: int, abc: str, meta: dict):
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"step_{step:06d}.abc"
+        target.write_text(abc, encoding="utf-8")
+        target.with_suffix(".json").write_text(json.dumps(meta, indent=1, ensure_ascii=False), encoding="utf-8")
+        return str(target)
+
+    return write
+
+
 def _lora_choices():
     return ["[None]"] + folder_paths.get_filename_list("loras")
 
@@ -58,10 +89,12 @@ def _tensorboard_dir(enabled: bool, folder: str):
     return str(path)
 
 
-def _save_checkpoint(lora_sd, name: str, steps: int, info: dict) -> str:
+def _save_checkpoint(lora_sd, name: str, steps: int, info: dict, state=None) -> str:
     target = _lora_dir() / f"{name}_{steps:06d}.safetensors"
     save_lora_file(lora_sd, target, info)
-    logging.info("YuE2 trainer: saved intermediate LoRA %s", target)
+    if state:
+        save_state(state, state_path(target))
+    logging.info("YuE2 trainer: saved intermediate LoRA %s%s", target, " (+ resume state)" if state else "")
     return str(target)
 
 
@@ -349,6 +382,11 @@ def _common_training_inputs(default_lr, default_steps):
                                "copy; set batch_size x grad_accumulation >= number of GPUs)."),
         io.Combo.Input("existing_lora", options=_lora_choices(), default="[None]",
                        tooltip="Continue training from a LoRA file in models/loras."),
+        io.Boolean.Input("resume_state", default=True,
+                         tooltip="When existing_lora has a .resume file next to it (written by save_every checkpoints and "
+                                 "by YuE2 Save LoRA), restore its optimizer state, random state and step count and "
+                                 "continue the same run; steps is then the total length of the run. Off: fresh "
+                                 "optimizer and schedule starting from the LoRA weights."),
         io.Int.Input("save_every", default=0, min=0, max=100000, advanced=True,
                      tooltip="Write an intermediate LoRA to models/loras every N steps (0 = off)."),
         io.String.Input("save_name", default="yue2_lora",
@@ -420,8 +458,8 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
     def execute(cls, model, clip, dataset, segment_seconds, conditioning, prefix_mode, use_semantic_tokens, train_acoustic_head,
                 caption_dropout, timestep_sampling, shift, steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
-                existing_lora, save_every, save_name, log_every, eval_every, eval_samples, eval_holdout, tensorboard,
-                tensorboard_dir):
+                existing_lora, resume_state, save_every, save_name, log_every, eval_every, eval_samples, eval_holdout,
+                tensorboard, tensorboard_dir):
         cfg = AcousticConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             lr_schedule=lr_schedule,
@@ -432,10 +470,11 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             timestep_sampling=timestep_sampling, shift=shift, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
+            resume_state=_resume_state(existing_lora, resume_state),
             log_every=log_every, eval_every=eval_every, eval_samples=eval_samples, eval_holdout=eval_holdout,
             tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
-        cfg.save_callback = lambda sd, n, info: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name})
+        cfg.save_callback = lambda sd, n, info, state=None: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name}, state)
         pbar = comfy.utils.ProgressBar(steps)
 
         def progress(done, total, loss):
@@ -445,7 +484,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress, interrupt_check=_interrupt)
         result.info["save_name"] = save_name
         report = _report(result)
-        return io.NodeOutput(result.lora_sd, {"loss": result.losses, "eval": result.evals, "info": result.info}, result.steps, report)
+        return io.NodeOutput(result.lora_sd, _loss_map(result), result.steps, report)
 
 
 class YuE2TrainerPlannerLoRA(io.ComfyNode):
@@ -472,18 +511,42 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
                                      "through head, tail and middle windows (the ending is always learned). 8192 "
                                      "fits most whole songs on a 16 GB card but also teaches the album's song "
                                      "lengths; keep 4096 for normal-length songs."),
+                io.Float.Input("regularization_fraction", default=0.5, min=0.0, max=0.9, step=0.05,
+                               tooltip="With a regularization dataset connected: share of the training draws taken from "
+                                       "its base-model scores instead of your songs. Keeps the planner writing "
+                                       "well-formed, normal-length scores while it picks up the album's style. "
+                                       "Ignored when nothing is connected."),
+                io.Int.Input("probe_every", default=0, min=0, max=100000,
+                             tooltip="Every N steps (and before step 1), write a whole ABC score with the current LoRA "
+                                     "through YuE2's own sampler and report its length and whether it ended. A probe "
+                                     "that runs to probe_max_tokens is the over-training signal the held-out loss "
+                                     "misses. Scores land in output/yue2_probes/<save_name>/. Set it to save_every. "
+                                     "0 = off. Each probe takes as long as one YuE2GenerateABC run."),
+                io.String.Input("probe_style", default="", multiline=True,
+                                tooltip="Style prompt for the probes (blank = the first training song's style)."),
+                io.String.Input("probe_lyrics", default="", multiline=True,
+                                tooltip="Lyrics for the probes (blank = the first training song's lyrics)."),
+                io.Int.Input("probe_max_tokens", default=8192, min=256, max=20000, advanced=True,
+                             tooltip="Token budget of a probe score; a probe that uses all of it did not end."),
+                io.Int.Input("probe_seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF, advanced=True,
+                             tooltip="Fixed sampling seed shared by all probes so they are comparable."),
                 *_common_training_inputs(5e-5, 100),
+                DATASET.Input("regularization", optional=True,
+                              tooltip="Scores the BASE model wrote (YuE2 Regularization Scores node, or a folder of YuE2 "
+                                      "output directories). Mixed into training at regularization_fraction so the "
+                                      "LoRA does not forget how to write and end a score."),
             ],
             outputs=[LORA_MODEL.Output("lora", display_name="lora"), LOSS_MAP.Output("loss_map", display_name="loss_map"),
                      io.Int.Output("steps", display_name="steps"), io.String.Output("report", display_name="report")],
         )
 
     @classmethod
-    def execute(cls, clip, dataset, train_abc, train_semantic, abc_mode, max_tokens, steps, learning_rate, lr_schedule,
+    def execute(cls, clip, dataset, train_abc, train_semantic, abc_mode, max_tokens, regularization_fraction,
+                probe_every, probe_style, probe_lyrics, probe_max_tokens, probe_seed, steps, learning_rate, lr_schedule,
                 rank, alpha,
                 targets, batch_size, grad_accumulation, warmup_steps, seed, optimizer, lora_dtype,
-                gradient_checkpointing, max_grad_norm, devices, existing_lora, save_every, save_name, log_every, eval_every, eval_samples,
-                eval_holdout, tensorboard, tensorboard_dir):
+                gradient_checkpointing, max_grad_norm, devices, existing_lora, resume_state, save_every, save_name, log_every,
+                eval_every, eval_samples, eval_holdout, tensorboard, tensorboard_dir, regularization=None):
         cfg = PlannerConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             lr_schedule=lr_schedule,
@@ -491,20 +554,35 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
             abc_mode=abc_mode, max_tokens=max_tokens, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
+            resume_state=_resume_state(existing_lora, resume_state),
+            regularization_fraction=regularization_fraction,
+            probe_every=probe_every, probe_style=probe_style, probe_lyrics=probe_lyrics,
+            probe_max_tokens=probe_max_tokens, probe_seed=probe_seed, probe_callback=_probe_writer(save_name),
             log_every=log_every, eval_every=eval_every, eval_samples=eval_samples, eval_holdout=eval_holdout,
             tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
-        cfg.save_callback = lambda sd, n, info: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name})
+        cfg.save_callback = lambda sd, n, info, state=None: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name}, state)
         pbar = comfy.utils.ProgressBar(steps)
 
         def progress(done, total, loss):
             pbar.update_absolute(done, total)
 
         with torch.inference_mode(False):
-            result = train_planner_lora(clip, dataset, cfg, progress=progress, interrupt_check=_interrupt)
+            result = train_planner_lora(clip, dataset, cfg, progress=progress, interrupt_check=_interrupt,
+                                        regularization=regularization)
         result.info["save_name"] = save_name
         report = _report(result)
-        return io.NodeOutput(result.lora_sd, {"loss": result.losses, "eval": result.evals, "info": result.info}, result.steps, report)
+        return io.NodeOutput(result.lora_sd, _loss_map(result), result.steps, report)
+
+
+def _loss_map(result) -> dict:
+    out = {"loss": result.losses, "eval": result.evals, "info": result.info}
+    for key in ("drift", "probe"):
+        if result.info.get(key):
+            out[key] = result.info[key]
+    if getattr(result, "state", None):
+        out["state"] = result.state
+    return out
 
 
 def _report(result) -> str:
@@ -514,13 +592,23 @@ def _report(result) -> str:
     lines = [f"{result.info.get('kind')} LoRA: {result.steps} steps in {result.seconds / 60:.1f} min",
              f"loss first10={head:.4f} last10={tail:.4f} min={min(losses):.4f}" if losses else "no steps"]
     evals = getattr(result, "evals", None) or []
+    label = "held-out" if result.info.get("eval_holdout") else "fixed-set"
     if len(evals) > 1:
         best = min(evals, key=lambda e: e[1])
-        lines.append(f"fixed-set eval loss: {evals[0][1]:.4f} before training -> {evals[-1][1]:.4f} at the end "
+        lines.append(f"{label} eval loss: {evals[0][1]:.4f} before training -> {evals[-1][1]:.4f} at the end "
                      f"(best {best[1]:.4f} at step {best[0]})")
+    drift = result.info.get("drift") or []
+    if len(drift) > 1:
+        lines.append(f"regularizer loss (base-model scores): {drift[0][1]:.4f} -> {drift[-1][1]:.4f}")
+    probes = result.info.get("probe") or []
+    if probes:
+        lines.append("probes: " + "; ".join(
+            f"step {p['step']}: {p['tokens']} tokens" + ("" if p["ended"] else " (BUDGET HIT, did not end)") for p in probes))
+        if probes[-1].get("path"):
+            lines.append(f"probe scores: {Path(probes[-1]['path']).parent}")
     if result.info.get("tensorboard"):
         lines.append(f"tensorboard run: {result.info['tensorboard']}")
-    lines.append(json.dumps(result.info, ensure_ascii=False))
+    lines.append(json.dumps({k: v for k, v in result.info.items() if k not in ("eval", "drift", "probe")}, ensure_ascii=False))
     return "\n".join(lines)
 
 
@@ -556,7 +644,103 @@ class YuE2TrainerSaveLoRA(io.ComfyNode):
         if loss_map and loss_map.get("loss"):
             info["final_loss"] = float(loss_map["loss"][-1])
         save_lora_file(lora, target, info)
+        if loss_map and loss_map.get("state"):
+            save_state(loss_map["state"], state_path(target))
+            logging.info("YuE2 trainer: saved resume state next to %s", target)
         return io.NodeOutput(str(target))
+
+
+class YuE2TrainerRegularizationScores(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="YuE2TrainerRegularizationScores",
+            display_name="YuE2 Regularization Scores",
+            category=CATEGORY,
+            description="Writes ABC scores with the BASE model (no LoRA) for a few prompts and returns them as a dataset "
+                        "for the planner trainer's regularization input. Like DreamBooth's class images: mixed into "
+                        "training, they keep the planner writing well-formed, normal-length scores. Scores are saved "
+                        "under output/<folder> as YuE2 output directories and reused on the next run.",
+            inputs=[
+                io.Clip.Input("clip", tooltip="CLIP from the YuE2 checkpoint WITHOUT any LoRA applied."),
+                io.String.Input("styles", default="", multiline=True,
+                                tooltip="One style prompt per line. Blank: the style prompts of the connected dataset's "
+                                        "songs are used (each with that song's lyrics)."),
+                io.String.Input("lyrics", default="", multiline=True,
+                                tooltip="Lyrics used with every prompt line above (blank = instrumental). Section tags "
+                                        "like [Verse] / [Chorus] as usual."),
+                io.Int.Input("scores_per_prompt", default=2, min=1, max=32,
+                             tooltip="Scores written per prompt (different seeds)."),
+                io.Combo.Input("mode", options=["full", "melody"], default="full",
+                               tooltip="Planning mode; use the abc_mode you train the planner with."),
+                io.Int.Input("seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF),
+                io.Int.Input("max_abc_tokens", default=8192, min=256, max=20000, advanced=True,
+                             tooltip="Scores that do not end within this budget are discarded (they would teach endless scores)."),
+                io.Float.Input("temperature", default=PROBE_SAMPLING["temperature"], min=0.0, max=5.0, step=0.05, advanced=True),
+                io.Float.Input("top_p", default=PROBE_SAMPLING["top_p"], min=0.01, max=1.0, step=0.01, advanced=True),
+                io.Int.Input("top_k", default=PROBE_SAMPLING["top_k"], min=1, max=1000, advanced=True),
+                io.Float.Input("repetition_penalty", default=PROBE_SAMPLING["repetition_penalty"], min=0.01, max=10.0,
+                               step=0.005, advanced=True),
+                io.String.Input("folder", default="yue2_regularization",
+                                tooltip="Where the scores are kept (relative paths live in ComfyUI/output). Existing "
+                                        "scores for the same prompt/seed/mode are reused, not regenerated."),
+                DATASET.Input("dataset", optional=True,
+                              tooltip="Training dataset: its songs' style prompts and lyrics are used when styles is blank."),
+            ],
+            outputs=[DATASET.Output("regularization", display_name="regularization"),
+                     io.String.Output("report", display_name="report")],
+        )
+
+    @classmethod
+    def execute(cls, clip, styles, lyrics, scores_per_prompt, mode, seed, max_abc_tokens, temperature, top_p, top_k,
+                repetition_penalty, folder, dataset=None):
+        import hashlib
+        prompts = [(line.strip(), lyrics) for line in styles.splitlines() if line.strip()]
+        if not prompts:
+            if dataset is None or not dataset.items:
+                raise ValueError("Enter at least one style prompt or connect a dataset to take the prompts from")
+            prompts = [(item.style, item.lyrics) for item in dataset.items if item.style]
+        root = Path(folder.strip().strip('"') or "yue2_regularization")
+        if not root.is_absolute():
+            root = Path(folder_paths.get_output_directory()) / root
+        sampling = {"temperature": temperature, "top_p": top_p, "top_k": top_k, "repetition_penalty": repetition_penalty}
+        items, written, reused, dropped = [], 0, 0, 0
+        total = len(prompts) * scores_per_prompt
+        pbar = comfy.utils.ProgressBar(total)
+        for p_index, (style, lyric) in enumerate(prompts):
+            for copy in range(scores_per_prompt):
+                _interrupt()
+                this_seed = (seed + p_index * 1000 + copy) % (2 ** 63)
+                key = hashlib.sha1(json.dumps([style, lyric, mode, this_seed, sampling], ensure_ascii=False).encode()).hexdigest()[:12]
+                folder_i = root / f"reg_{p_index:03d}_{copy:02d}_{key}"
+                request = folder_i / "request.json"
+                score = folder_i / "score.abc"
+                if request.is_file() and score.is_file():
+                    reused += 1
+                else:
+                    abc, count, ended = generate_abc(clip, style, lyric, mode, this_seed, max_abc_tokens, sampling)
+                    if not ended:
+                        logging.warning("YuE2 trainer: regularization score for prompt %d seed %d used the whole %d-token "
+                                        "budget without ending; discarded", p_index, this_seed, max_abc_tokens)
+                        dropped += 1
+                        pbar.update_absolute(p_index * scores_per_prompt + copy + 1, total)
+                        continue
+                    folder_i.mkdir(parents=True, exist_ok=True)
+                    score.write_text(abc, encoding="utf-8")
+                    request.write_text(json.dumps({"id": folder_i.name, "style": style, "lyrics": lyric, "cot": mode,
+                                                   "seed": this_seed, "abc_tokens": count, "sampling": sampling,
+                                                   "generated_by": "YuE2TrainerRegularizationScores"},
+                                                  indent=1, ensure_ascii=False), encoding="utf-8")
+                    written += 1
+                items.append(Item(id=folder_i.name, audio_path=None, style=style, lyrics=lyric,
+                                  abc=score.read_text(encoding="utf-8"), source="regularization"))
+                pbar.update_absolute(p_index * scores_per_prompt + copy + 1, total)
+        if not items:
+            raise ValueError("No regularization scores: every score ran past max_abc_tokens; raise it or lower temperature")
+        report = (f"{len(items)} regularization scores from {len(prompts)} prompts ({written} written, {reused} reused, "
+                  f"{dropped} discarded for not ending) in {root}")
+        logging.info("YuE2 trainer: %s", report)
+        return io.NodeOutput(Dataset(items=items, meta={"folder": str(root), "kind": "regularization"}), report)
 
 
 class YuE2TrainerLoadLoRA(io.ComfyNode):
@@ -596,6 +780,7 @@ class YuE2TrainerExtension(ComfyExtension):
             YuE2TrainerEncodeDataset,
             YuE2TrainerAcousticLoRA,
             YuE2TrainerPlannerLoRA,
+            YuE2TrainerRegularizationScores,
             YuE2TrainerSaveLoRA,
             YuE2TrainerLoadLoRA,
         ]

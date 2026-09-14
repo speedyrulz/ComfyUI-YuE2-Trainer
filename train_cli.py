@@ -131,6 +131,9 @@ def save_result(result, args, kind: str):
     info = {**result.info, "final_loss": result.losses[-1] if result.losses else None}
     save_lora_file(result.lora_sd, out, info)
     (out.with_suffix(".loss.json")).write_text(json.dumps({"loss": result.losses, "eval": result.evals, "info": info}, indent=1))
+    if getattr(result, "state", None):
+        from yue2_trainer.resume import save_state, state_path
+        save_state(result.state, state_path(out))
     logging.info("saved %s LoRA (%d tensors) to %s", kind, len(result.lora_sd), out)
     return out
 
@@ -175,6 +178,8 @@ def add_common(p):
                    help="Log loss/lr/grad-norm to TensorBoard under DIR (tensorboard --logdir DIR).")
     p.add_argument("--run-name", default="", help="TensorBoard run name (default: output name).")
     p.add_argument("--existing-lora", default=None)
+    p.add_argument("--no-resume", action="store_true",
+                   help="Ignore the .resume state next to --existing-lora (fresh optimizer and schedule).")
     p.add_argument("--save-every", type=int, default=0)
     p.add_argument("--out", required=True, help="Output LoRA name (goes to models/loras) or path.")
     p.add_argument("--dry-run", action="store_true", help="Prepare data and LoRA, run 0 steps.")
@@ -200,6 +205,16 @@ def main(argv=None):
     pp.add_argument("--semantic", action="store_true", help="Also train the semantic-token target.")
     pp.add_argument("--abc-mode", default="full", choices=["full", "melody", "auto"])
     pp.add_argument("--max-tokens", type=int, default=4096)
+    pp.add_argument("--regularization", default=None, metavar="DIR",
+                    help="Folder of base-model scores (YuE2 output directories / .abc sidecars) mixed into training.")
+    pp.add_argument("--regularization-fraction", type=float, default=0.5)
+    pp.add_argument("--probe-every", type=int, default=0,
+                    help="Generate a whole ABC score with the current LoRA every N steps (and before step 1); 0 = off.")
+    pp.add_argument("--probe-style", default="", help="Probe style prompt (default: first training item's).")
+    pp.add_argument("--probe-lyrics", default="", help="Probe lyrics, or @file to read them from a file.")
+    pp.add_argument("--probe-max-tokens", type=int, default=8192)
+    pp.add_argument("--probe-seed", type=int, default=0)
+    pp.add_argument("--probe-dir", default=None, help="Where probe scores are written (default: <out>_probes/).")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -222,21 +237,43 @@ def main(argv=None):
         del audio_encoder
     comfy.model_management.unload_all_models()
     logging.info("encoded dataset:\n%s", dataset.describe())
-    existing = load_lora_file(resolve_model_file("loras", args.existing_lora)) if args.existing_lora else None
+    existing = resume = None
+    if args.existing_lora:
+        from yue2_trainer.resume import load_state, state_path
+        lora_path = resolve_model_file("loras", args.existing_lora)
+        existing = load_lora_file(lora_path)
+        if not args.no_resume:
+            resume = load_state(state_path(lora_path))
+            if resume is None:
+                logging.info("no resume state next to %s; continuing from its weights with a fresh optimizer", lora_path)
     steps = 0 if args.dry_run else args.steps
 
     def progress(done, total, loss):
         pass  # the trainer's TrainMonitor prints step/loss lines
 
-    def save_partial(sd, n, info):
+    def save_partial(sd, n, info, state=None):
         from yue2_trainer.lora import save_lora_file
+        from yue2_trainer.resume import save_state, state_path
         path = Path(args.out).with_suffix("")
         target = Path(f"{path}_{n:06d}.safetensors")
         if not target.is_absolute() and target.parent == Path("."):
             import folder_paths
             target = Path(folder_paths.get_folder_paths("loras")[0]) / target
         save_lora_file(sd, target, info)
-        logging.info("saved intermediate LoRA %s", target)
+        if state:
+            save_state(state, state_path(target))
+        logging.info("saved intermediate LoRA %s%s", target, " (+ resume state)" if state else "")
+
+    def probe_writer(step, abc, meta):
+        folder = Path(args.probe_dir) if getattr(args, "probe_dir", None) else Path(str(Path(args.out).with_suffix("")) + "_probes")
+        if not folder.is_absolute() and folder.parent == Path("."):
+            import folder_paths
+            folder = Path(folder_paths.get_folder_paths("loras")[0]) / folder
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"step_{step:06d}.abc"
+        target.write_text(abc, encoding="utf-8")
+        target.with_suffix(".json").write_text(json.dumps(meta, indent=1, ensure_ascii=False), encoding="utf-8")
+        return str(target)
 
     with torch.inference_mode(False):
         if args.command == "acoustic":
@@ -250,26 +287,36 @@ def main(argv=None):
                                  timestep_sampling=args.timestep_sampling, shift=args.shift, warmup_steps=args.warmup,
                                  seed=args.seed, lora_dtype=args.lora_dtype,
                                  gradient_checkpointing=not args.no_checkpointing, optimizer=args.optimizer,
-                                 devices=args.devices, existing_lora=existing,
+                                 devices=args.devices, existing_lora=existing, resume_state=resume,
                                  log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
                                  eval_holdout=args.eval_holdout,
                                  tensorboard_dir=args.tensorboard or "",
                                  run_name=args.run_name or Path(args.out).stem, save_every=args.save_every, save_callback=save_partial)
             result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress)
         else:
+            from yue2_trainer.dataset import scan_folder
             from yue2_trainer.planner import PlannerConfig, train_planner_lora
+            probe_lyrics = args.probe_lyrics
+            if probe_lyrics.startswith("@"):
+                probe_lyrics = Path(probe_lyrics[1:]).read_text(encoding="utf-8")
+            regularization = scan_folder(args.regularization) if args.regularization else None
+            if regularization is not None:
+                logging.info("regularization scores:\n%s", regularization.describe())
             cfg = PlannerConfig(steps=steps, batch_size=args.batch_size, grad_accumulation=args.grad_accumulation,
                                 learning_rate=args.lr, lr_schedule=args.lr_schedule, rank=args.rank, alpha=args.alpha, targets=args.targets,
                                 train_abc=not args.no_abc, train_semantic=args.semantic, abc_mode=args.abc_mode,
                                 max_tokens=args.max_tokens, warmup_steps=args.warmup, seed=args.seed,
                                 lora_dtype=args.lora_dtype, gradient_checkpointing=not args.no_checkpointing,
-                                optimizer=args.optimizer, devices=args.devices, existing_lora=existing,
+                                optimizer=args.optimizer, devices=args.devices, existing_lora=existing, resume_state=resume,
+                                regularization_fraction=args.regularization_fraction,
+                                probe_every=args.probe_every, probe_style=args.probe_style, probe_lyrics=probe_lyrics,
+                                probe_max_tokens=args.probe_max_tokens, probe_seed=args.probe_seed, probe_callback=probe_writer,
                                 log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
                                 eval_holdout=args.eval_holdout,
                                 tensorboard_dir=args.tensorboard or "",
                                 run_name=args.run_name or Path(args.out).stem,
                                 save_every=args.save_every, save_callback=save_partial)
-            result = train_planner_lora(clip, dataset, cfg, progress=progress)
+            result = train_planner_lora(clip, dataset, cfg, progress=progress, regularization=regularization)
     out = save_result(result, args, args.command)
     print(f"done: {out}", flush=True)
     return 0

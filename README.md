@@ -86,7 +86,8 @@ C:/ai/ComfyUI/venv/Scripts/python.exe prepare_dataset.py D:/songs --sections cla
 | **YuE2 Merge Datasets** | Concatenate two datasets. |
 | **YuE2 Encode Dataset** | VAE-encode every item to latents in fp32 (cached under `output/yue2_trainer_cache`), optionally transcribe missing ABC with a SheetSage2 `AUDIO_ENCODER`. |
 | **YuE2 Train Acoustic LoRA (MODEL)** | Flow-matching LoRA training of the acoustic model. Outputs `LORA_MODEL`, `LOSS_MAP`, steps, a text report. |
-| **YuE2 Train Planner LoRA (CLIP)** | Next-token LoRA training of the language model on ABC (and semantic tokens when present). |
+| **YuE2 Train Planner LoRA (CLIP)** | Next-token LoRA training of the language model on ABC (and semantic tokens when present). Optional regularization input and checkpoint probes (see below). |
+| **YuE2 Regularization Scores** | Writes ABC scores with the base model for a few prompts and returns them as a dataset for the planner trainer's `regularization` input (saved under `output/yue2_regularization`, reused on later runs). |
 | **YuE2 Save LoRA** | Writes the LoRA to `models/loras/<name>.safetensors` with training metadata; with `name` blank and `loss_map` connected it uses the trainer's `save_name`. The core `SaveLoRA` node also works (it writes to `output/`). |
 | **YuE2 Load LoRA** | Applies a LoRA to MODEL and/or CLIP; either input can be left unconnected. |
 
@@ -99,7 +100,9 @@ or use *Load*; recent frontends import API-format JSON):
 
 - `yue2_train_acoustic_lora_api.json` – checkpoint → dataset → encode → acoustic LoRA → save + loss plot
 - `yue2_prepare_and_train_acoustic_api.json` – same, but **Prepare Dataset** generates the style/lyrics sidecars first
-- `yue2_train_planner_lora_api.json` – same with SheetSage2 transcription (`full`, with chords) → planner LoRA
+- `yue2_train_planner_lora_api.json` – same with SheetSage2 transcription (`full`, with chords) → planner LoRA,
+  100 steps at `5e-5` with a checkpoint and a probe score every 25 steps (add a **YuE2 Regularization Scores**
+  node on the base CLIP and connect it to `regularization` to keep the planner from over-training)
 - `yue2_generate_with_lora_api.json` – the stock YuE2 generation graph with **YuE2 Load LoRA** between the
   checkpoint loader and the YuE2 nodes
 
@@ -137,7 +140,13 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   ComfyUI's LoRA adapter initialises the fixed matrix about 8x larger than PEFT/kohya trainers do, so
   `1e-4` here moves the weights roughly as much as `8e-4` would in a PEFT-style trainer (about 6% of the
   weight norm after 1000 steps at rank 32); do not copy a higher learning rate from other trainers.
-- `save_every` writes `models/loras/<save_name>_<steps>.safetensors` checkpoints; `existing_lora` resumes.
+- `save_every` writes `models/loras/<save_name>_<steps>.safetensors` checkpoints, each with a `<name>.resume`
+  file next to it (optimizer moments, every replica's random state, step count, loss history). **YuE2 Save
+  LoRA** writes the same file next to the final LoRA. `existing_lora` + `resume_state` (on) continues that
+  exact run: `steps` is then the run's total length (a checkpoint from step 50 with `steps` 100 trains 50
+  more on the same cosine schedule), the loss / eval curves carry on, and a state whose trainer, rank,
+  targets or optimizer differ is ignored with a warning. `resume_state` off (or no `.resume` file) starts a
+  new run from the LoRA weights with a fresh optimizer and schedule, as before.
 - `eval_every` (50) / `eval_samples` (8) / `eval_holdout` (1): score a fixed evaluation set before step 1 and
   every N steps. By default one song is held out of training and the set is drawn from it (fixed crops; for
   the acoustic trainer also fixed sigmas, stratified over the sigma distribution, and fixed noise), so the
@@ -160,12 +169,35 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   the 4,000-token mark and it keeps writing normal-length songs for your lyrics). (Before September 2026 the crop was a uniformly random window, which for 4-9 minute
   songs almost never contained the closing token; planner LoRAs from that version stop ending their scores
   after a few dozen steps and should be retrained.)
+- `regularization` (optional input) + `regularization_fraction` (0.5): scores the *base* model wrote, mixed
+  into training. This is prior preservation, the DreamBooth "class images" idea: with a handful of album
+  scores the planner starts imitating them so hard after a few dozen steps that it forgets how a score ends
+  and runs to the token cap. Drawing half the steps from the base model's own scores keeps it anchored to
+  well-formed, normal-length writing while it picks up the album's melodic and harmonic habits. Make the
+  scores with **YuE2 Regularization Scores** (base CLIP, no LoRA): give it a few style prompts, one per line,
+  or connect the training dataset to use your songs' own prompts and lyrics; 2 scores per prompt and 4-8
+  prompts is plenty. Scores that do not end within `max_abc_tokens` are discarded. A folder of YuE2 output
+  directories (`request.json` + `score.abc`) or `.abc` sidecars works too. When a regularization set is
+  connected, every evaluation also reports the `regularizer loss` on fixed crops of those scores: it starts
+  at the base model's own value and should stay close to it; a steady climb means the LoRA is drifting away
+  from base-model writing faster than the regularization can hold it (lower the learning rate or raise the
+  fraction).
+- `probe_every` (0 = off; set it to `save_every`): every N steps, and before step 1, the trainer writes one
+  whole ABC score with the current LoRA through YuE2's own sampler (same defaults as `YuE2GenerateABC`,
+  fixed `probe_seed`) and reports its length and whether it produced the closing token. A probe that uses
+  its whole `probe_max_tokens` budget is the over-training signal the held-out loss misses. `probe_style` /
+  `probe_lyrics` default to the first training song's. The scores land in
+  `output/yue2_probes/<save_name>/step_000025.abc` (with a `.json` of the numbers), so you can drop any of
+  them into `YuE2GenerateMusic`'s `abc` input and listen to what each checkpoint writes. Each probe costs as
+  much as one `YuE2GenerateABC` run (a minute or two for a 3,000-token score, more for one that hits the
+  cap).
 - The planner learns fast: every step supervises thousands of score tokens, so 25-100 steps at `5e-5`
-  (the node defaults are 100 steps, `5e-5`, cosine) already reshape the writing. Watch the fixed-set eval
-  line and keep `save_every` small (5-25) so you can pick the best checkpoint. Treat the held-out minimum as
-  advisory: on a handful of songs the checkpoint that sounds closest to the album is often a little past it.
-  A planner LoRA that makes `YuE2GenerateABC` run to `max_abc_tokens` instead of finishing is either
-  over-trained (use an earlier checkpoint) or has learned album-length scores (see `max_tokens` above).
+  (the node defaults are 100 steps, `5e-5`, cosine) already reshape the writing. Watch the held-out eval
+  line and the probes, and keep `save_every` small (5-25) so you can pick the best checkpoint. Treat the
+  held-out minimum as advisory: on a handful of songs the checkpoint that sounds closest to the album is
+  often a little past it. A planner LoRA that makes `YuE2GenerateABC` run to `max_abc_tokens` instead of
+  finishing is either over-trained (use an earlier checkpoint, or retrain with a regularization set) or has
+  learned album-length scores (see `max_tokens` above).
 
 Both trainers use gradient checkpointing, bf16 autocast, fp32 LoRA weights, grad clipping, and run
 one item per micro-step (`batch_size × grad_accumulation` items per optimizer step).
@@ -228,8 +260,20 @@ generating properly, so it cannot tell you when to stop; use it only to confirm 
 all. For the planner the held-out cross-entropy typically bottoms out after a few dozen steps on a small
 album; the acoustic held-out loss moves by hundredths over a thousand steps.
 
-Turn on `tensorboard` to also log `loss/step`, `loss/avg20`, `loss/eval_fixed`, `lr` and `grad_norm` per
-step, plus the run configuration and final result as text. Runs land in `ComfyUI/output/yue2_tensorboard/<save_name>_<timestamp>`
+For the planner, add probes (`probe_every`): the console then also shows
+
+```
+YuE2 planner probe step 25/100  3103 ABC tokens in 1:52, ended normally  (step 0: 2871 tokens)  -> .../step_000025.abc
+YuE2 planner probe step 50/100  8192 ABC tokens in 4:40, HIT THE TOKEN BUDGET without ending (over-trained or album-length scores)
+```
+
+and the run summary lists every probe. The step whose probe last ended normally is the latest checkpoint
+worth keeping; with a regularization set connected the `regularizer loss` line should stay near its starting
+value.
+
+Turn on `tensorboard` to also log `loss/step`, `loss/avg20`, `loss/eval_heldout` (or `loss/eval_fixed`),
+`loss/eval_regularizer`, `probe/abc_tokens`, `probe/ended`, `lr` and `grad_norm` per step, plus the run
+configuration and final result as text. Runs land in `ComfyUI/output/yue2_tensorboard/<save_name>_<timestamp>`
 (`tensorboard_dir` changes the parent folder); view them with
 
 ```bash
@@ -271,9 +315,12 @@ C:/ai/ComfyUI/venv/Scripts/python.exe train_cli.py planner --comfy-root C:/ai/Co
     --data D:/songs --transcribe melody --steps 400 --out indie_pop_planner
 ```
 
-`--out` names go to `models/loras`; `--save-every N` writes checkpoints; `--existing-lora` resumes;
-`--dry-run` prepares everything and trains 0 steps. `--devices cuda:1` picks a GPU, `--devices all` uses every
-GPU data-parallel (see *Choosing GPUs*).
+`--out` names go to `models/loras`; `--save-every N` writes checkpoints (each with a `.resume` state file);
+`--existing-lora` continues a run, restoring its `.resume` state unless `--no-resume`; `--dry-run` prepares
+everything and trains 0 steps. `--devices cuda:1` picks a GPU, `--devices all` uses every GPU data-parallel
+(see *Choosing GPUs*). Planner extras: `--regularization DIR` (+ `--regularization-fraction`) mixes in a
+folder of base-model scores, `--probe-every N` (+ `--probe-style`, `--probe-lyrics` or `@file`,
+`--probe-max-tokens`, `--probe-dir`) writes probe scores to `<out>_probes/`.
 
 ## How it works
 
