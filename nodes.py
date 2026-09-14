@@ -469,8 +469,9 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
                                        "auto: chords in the score -> full, else melody."),
                 io.Int.Input("max_tokens", default=4096, min=64, max=20000,
                              tooltip="Longest trained span (ABC or codec tokens) per step. Longer scores are trained "
-                                     "through head, tail and middle windows (the ending is always learned); 8192 "
-                                     "fits most whole songs on a 16 GB card."),
+                                     "through head, tail and middle windows (the ending is always learned). 8192 "
+                                     "fits most whole songs on a 16 GB card but also teaches the album's song "
+                                     "lengths; keep 4096 for normal-length songs."),
                 *_common_training_inputs(5e-5, 100),
             ],
             outputs=[LORA_MODEL.Output("lora", display_name="lora"), LOSS_MAP.Output("loss_map", display_name="loss_map"),

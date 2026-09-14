@@ -154,13 +154,18 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   three windows per step: its head, its tail (ending with the closing token) or a random middle window, and
   windows that do not start at the beginning keep their first 256 tokens as unsupervised context. So the
   model always keeps learning how a score opens and how it ends. 8192 lets most whole songs train in one
-  piece on a 16 GB card. (Before September 2026 the crop was a uniformly random window, which for 4-9 minute
+  piece on a 16 GB card, but whole songs also teach the album's song *lengths*: a LoRA trained on 6-9-minute
+  songs writes 6,000-9,000-token scores, which hits `YuE2GenerateABC`'s `max_abc_tokens` (raise it to
+  12,000+ and `max_duration` to match, or keep `max_tokens` at 4096 so the endings the model sees sit near
+  the 4,000-token mark and it keeps writing normal-length songs for your lyrics). (Before September 2026 the crop was a uniformly random window, which for 4-9 minute
   songs almost never contained the closing token; planner LoRAs from that version stop ending their scores
   after a few dozen steps and should be retrained.)
 - The planner learns fast: every step supervises thousands of score tokens, so 25-100 steps at `5e-5`
   (the node defaults are 100 steps, `5e-5`, cosine) already reshape the writing. Watch the fixed-set eval
-  line and keep `save_every` small (10-25) so you can pick the best checkpoint. A planner LoRA that makes
-  `YuE2GenerateABC` run to `max_abc_tokens` instead of finishing is over-trained: use an earlier checkpoint.
+  line and keep `save_every` small (5-25) so you can pick the best checkpoint. Treat the held-out minimum as
+  advisory: on a handful of songs the checkpoint that sounds closest to the album is often a little past it.
+  A planner LoRA that makes `YuE2GenerateABC` run to `max_abc_tokens` instead of finishing is either
+  over-trained (use an earlier checkpoint) or has learned album-length scores (see `max_tokens` above).
 
 Both trainers use gradient checkpointing, bf16 autocast, fp32 LoRA weights, grad clipping, and run
 one item per micro-step (`batch_size × grad_accumulation` items per optimizer step).
