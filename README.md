@@ -70,20 +70,23 @@ the acoustic node work on your own recordings. Files to download yourself (both 
 [m-a-p/MERT-v2-FullSong](https://huggingface.co/m-a-p/MERT-v2-FullSong) (a local folder for the `mert`
 input, or leave the Hugging Face id and it is fetched into the HF cache on first use, about 630 MB). The
 head's NAR companion LoRA is not needed and not used: in our test it made renders less similar to the
-original.
+original. Note for anyone running the head elsewhere: with transformers 5, `AutoModel.from_pretrained`
+leaves MERT-v2's rotary `inv_freq` buffer uninitialised (features silently wrong or NaN, differently on
+every load); the node builds the model from its config and loads the weights into it, which is what the
+numbers below used.
 
 How good is it? We measured a round trip (real 60-second excerpts -> head -> tokens -> base acoustic model,
 64 steps, shift 3, cfg 2) against the originals, frame aligned:
 
 | | chroma corr | onset corr | CLAP cos |
 |---|---|---|---|
-| Master of Puppets 1:00-2:00, round trip | 0.63 | 0.86 | 0.84 |
-| Battery 1:10-2:10, round trip | 0.57 | 0.90 | 0.78 |
+| Master of Puppets 1:00-2:00, round trip | 0.65 | 0.85 | 0.83 |
+| Battery 1:10-2:10, round trip | 0.60 | 0.90 | 0.80 |
 | a plain base-model generation for the same prompt | -0.02 | 0.03 | 0.55 |
 | two different real songs from the album | 0.12 | 0.05 | 0.92 |
-| a YuE2 generation, tokens re-predicted from its audio | 0.86 | 0.88 | 0.97 |
+| a YuE2 generation, tokens re-predicted from its audio | 0.78 | 0.73 | 0.92 |
 
-Exact top-1 agreement with YuE2's true codes is only about 9-16%, but near-miss codes render almost the
+Exact top-1 agreement with YuE2's true codes is only about 11%, but near-miss codes render almost the
 same: the round trip keeps the rhythm and most of the harmony of a real recording, far above what a
 generation from the prompt alone shares with it. Expect the timbre and vocal detail to be YuE2's, not the
 recording's. Treat sidecars from this head as approximate: when the official tokenizer ships, delete the
@@ -397,8 +400,7 @@ unit tests.
 - **Semantic tokens for real audio are approximate.** YuE2's semantic tokenizer (audio → 32 768-token codec)
   has not been released. Exact tokens exist only for YuE2's own outputs; for your recordings the
   **YuE2 Semantic Tokens** node predicts them with a community head (see *Semantic tokens for your own
-  recordings*), which keeps rhythm and most harmony but not every code, and whose argmax flips on near-ties
-  between GPUs and precisions (about 80% frame agreement between two runs). Without those sidecars the
+  recordings*), which keeps rhythm and most harmony but not every code. Without those sidecars the
   acoustic LoRA is conditioned in text-only mode, which the base model was trained with (codec dropout) but
   is not the mode used at inference; expect it to transfer sound/timbre and leave composition to the
   (frozen or planner-LoRA) AR stage — see *What an acoustic LoRA can and cannot change* above.
