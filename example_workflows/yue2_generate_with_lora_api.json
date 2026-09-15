@@ -120,8 +120,8 @@
     0
    ],
    "seed": 831001,
-   "steps": 64,
-   "cfg": 2.0,
+   "steps": 32,
+   "cfg": 1.0,
    "sampler_name": "euler",
    "scheduler": "simple",
    "denoise": 1.0

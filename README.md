@@ -146,7 +146,11 @@ or use *Load*; recent frontends import API-format JSON):
   checkpoint loader and the YuE2 nodes
 
 Generation with a LoRA is the standard graph: `CheckpointLoaderSimple → YuE2 Load LoRA → YuE2GenerateABC /
-YuE2GenerateMusic → ModelSamplingAuraFlow(shift 3) → KSampler(64 steps, cfg 2, euler, simple) → VAEDecodeAudio`.
+YuE2GenerateMusic → ModelSamplingAuraFlow(shift 3) → KSampler(32 steps, cfg 1, euler, simple) → VAEDecodeAudio`.
+The stock template uses 64 steps and cfg 2; in a same-seed comparison the step count, solver and shift changed the
+render by less than 0.1% while cfg 2 (guidance against a zeroed conditioning the model never saw in training)
+moved it *away* from the training album by 0.07 CLAP. The reference implementation runs the acoustic stage
+without guidance, so the example uses cfg 1, which also halves sampling time.
 An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects the two YuE2 generate nodes.
 
 ### Settings that matter
