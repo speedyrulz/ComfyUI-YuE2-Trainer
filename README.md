@@ -136,8 +136,11 @@ The core `LossGraphNode` plots the `LOSS_MAP` output; `PreviewAny` shows the rep
 Ready-to-load API-format graphs are in [`example_workflows/`](example_workflows) (drag onto the canvas
 or use *Load*; recent frontends import API-format JSON):
 
-- `yue2_train_acoustic_lora_api.json` – checkpoint → dataset → encode → acoustic LoRA → save + loss plot
-- `yue2_prepare_and_train_acoustic_api.json` – same, but **Prepare Dataset** generates the style/lyrics sidecars first
+- `yue2_train_acoustic_lora_api.json` – checkpoint → dataset → encode (SheetSage2 `full` transcription) →
+  **YuE2 Semantic Tokens** → acoustic LoRA (`inference_like` conditioning on the songs' semantic tokens, rank 32,
+  1000 steps, `keep` = best_eval, checkpoints every 250) → save + loss plot; needs the community tokenizer head
+- `yue2_prepare_and_train_acoustic_api.json` – the text-only variant (no transcription or tokenizer head):
+  **Prepare Dataset** generates the style/lyrics sidecars, then `compact` acoustic training
 - `yue2_train_planner_lora_api.json` – same with SheetSage2 transcription (`full`, with chords) → planner LoRA,
   100 steps at `5e-5` with a checkpoint and a probe score every 10 steps and a **YuE2 Regularization Scores**
   node (base scores for the dataset's own prompts) on the `regularization` input

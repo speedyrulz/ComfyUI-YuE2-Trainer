@@ -14,6 +14,12 @@
    "recursive": true
   }
  },
+ "9": {
+  "class_type": "AudioEncoderLoader",
+  "inputs": {
+   "audio_encoder_name": "sheetsage2_bf16.safetensors"
+  }
+ },
  "3": {
   "class_type": "YuE2TrainerEncodeDataset",
   "inputs": {
@@ -25,7 +31,11 @@
     "1",
     2
    ],
-   "transcribe": "none",
+   "audio_encoder": [
+    "9",
+    0
+   ],
+   "transcribe": "full",
    "max_seconds": 0.0,
    "window_seconds": 60,
    "cache_dir": "yue2_trainer_cache",
@@ -45,19 +55,19 @@
     1
    ],
    "dataset": [
-    "3",
+    "10",
     0
    ],
    "segment_seconds": 30.0,
    "prefix_mode": "full",
-   "use_semantic_tokens": false,
+   "use_semantic_tokens": true,
    "train_acoustic_head": false,
    "timestep_sampling": "uniform",
    "shift": 1.0,
-   "steps": 300,
+   "steps": 1000,
    "learning_rate": 0.0001,
-   "rank": 16,
-   "alpha": 16.0,
+   "rank": 32,
+   "alpha": 32.0,
    "targets": "attention+mlp",
    "batch_size": 1,
    "grad_accumulation": 1,
@@ -68,7 +78,7 @@
    "gradient_checkpointing": true,
    "max_grad_norm": 1.0,
    "existing_lora": "[None]",
-   "save_every": 50,
+   "save_every": 250,
    "save_name": "yue2_acoustic",
    "devices": "auto",
    "log_every": 1,
@@ -76,12 +86,12 @@
    "tensorboard_dir": "yue2_tensorboard",
    "lr_schedule": "cosine",
    "caption_dropout": 0.1,
-   "conditioning": "compact",
-   "eval_every": 50,
+   "conditioning": "inference_like",
+   "eval_every": 100,
    "eval_samples": 8,
    "eval_holdout": 1,
    "resume_state": true,
-   "keep": "final"
+   "keep": "best_eval"
   }
  },
  "5": {
@@ -123,6 +133,29 @@
   "inputs": {
    "source": [
     "3",
+    1
+   ]
+  }
+ },
+ "10": {
+  "class_type": "YuE2TrainerSemanticTokens",
+  "inputs": {
+   "dataset": [
+    "3",
+    0
+   ],
+   "head": "tokenizer_head_joint_v4.pt",
+   "mert": "m-a-p/MERT-v2-FullSong",
+   "device": "auto",
+   "force": false,
+   "write_sidecars": true
+  }
+ },
+ "12": {
+  "class_type": "PreviewAny",
+  "inputs": {
+   "source": [
+    "10",
     1
    ]
   }
