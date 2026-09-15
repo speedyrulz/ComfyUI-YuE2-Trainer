@@ -141,7 +141,12 @@ def sample_latents(patcher, conditioning: list, frames: int, seed: int, steps: i
 
 def decode_audio(vae, latents: torch.Tensor, device) -> tuple[np.ndarray, int]:
     """VAE-decode [1, 64, T] latents on ``device`` without going through ComfyUI's model loader (which could
-    evict a model under training); the VAE weights go back where they were. Returns (float32 [N, C], rate)."""
+    evict a model under training); the VAE weights go back where they were. Returns (float32 [N, C], rate).
+
+    Everything here, the device moves included, runs under ``torch.inference_mode()``: ComfyUI builds the VAE
+    under it, and weights created there have to be moved there too. A ``.to()`` outside it (the trainers run
+    outside it) leaves them without a version counter, and the first view of such a weight then fails with
+    "Inference tensors do not track version counter"."""
     module = vae.first_stage_model
     origin = next(module.parameters()).device
     dtype = getattr(vae, "vae_dtype", torch.float32)
@@ -149,23 +154,23 @@ def decode_audio(vae, latents: torch.Tensor, device) -> tuple[np.ndarray, int]:
 
     def run(target):
         module.to(target)
-        with torch.no_grad():
-            audio = process(module.decode(latents.to(target, dtype)).float())
+        audio = process(module.decode(latents.to(target, dtype)).float())
         if audio.shape[-1] <= 8 < audio.shape[1]:   # the raw module gives [B, C, N]; accept [B, N, C] too
             audio = audio.movedim(-1, 1)
         return audio
-    try:
+    with torch.inference_mode():
         try:
-            audio = run(torch.device(device))
-        except torch.cuda.OutOfMemoryError:
-            LOG.warning("YuE2 trainer: not enough VRAM on %s to decode %d frames; decoding on the CPU", device, latents.shape[-1])
-            torch.cuda.empty_cache()
-            audio = run(torch.device("cpu"))
-    finally:
-        module.to(origin)
-    std = torch.std(audio, dim=[1, 2], keepdim=True) * 5.0
-    std[std < 1.0] = 1.0
-    audio = (audio / std)[0].clamp(-1.0, 1.0).cpu().numpy().T
+            try:
+                audio = run(torch.device(device))
+            except torch.cuda.OutOfMemoryError:
+                LOG.warning("YuE2 trainer: not enough VRAM on %s to decode %d frames; decoding on the CPU", device, latents.shape[-1])
+                torch.cuda.empty_cache()
+                audio = run(torch.device("cpu"))
+        finally:
+            module.to(origin)
+        std = torch.std(audio, dim=[1, 2], keepdim=True) * 5.0
+        std[std < 1.0] = 1.0
+        audio = (audio / std)[0].clamp(-1.0, 1.0).cpu().numpy().T
     rate = int(getattr(vae, "audio_sample_rate_output", getattr(vae, "audio_sample_rate", SAMPLE_RATE)))
     return np.ascontiguousarray(audio, dtype=np.float32), rate
 

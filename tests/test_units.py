@@ -227,6 +227,38 @@ def test_render_helpers(tmp_path):
     assert R.sample_stream(items[:1], None, 2.0) is None
 
 
+def test_decode_audio_with_a_vae_built_under_inference_mode():
+    """ComfyUI's checkpoint loader builds the VAE under inference mode; the trainers (which run outside it)
+    decode by moving that module by hand, so the move has to happen under inference mode as well."""
+    import yue2_trainer.render as R
+
+    class Decoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.alpha = nn.Parameter(torch.zeros(2))
+            self.conv = nn.Conv1d(64, 2, 1)
+
+        def decode(self, x):   # ComfyUI's Snake activation reads a plain parameter through a view
+            return self.conv(x) + self.alpha.unsqueeze(0).unsqueeze(-1).to(x.device)
+
+    class FakeVAE:
+        vae_dtype = torch.float32
+        audio_sample_rate = 48000
+
+        def __init__(self):
+            with torch.inference_mode():
+                self.first_stage_model = Decoder()
+
+    vae = FakeVAE()
+    assert next(vae.first_stage_model.parameters()).is_inference()
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"   # a real device move is what used to break
+    with torch.inference_mode(False):
+        for _ in range(2):   # out and back twice: the weights stay usable
+            audio, rate = R.decode_audio(vae, torch.randn(1, 64, 20), device)
+            assert audio.shape == (20, 2) and rate == 48000 and audio.dtype == np.float32
+            assert next(vae.first_stage_model.parameters()).device.type == "cpu"
+
+
 def test_chunked_cross_entropy():
     torch.manual_seed(0)
     head = nn.Linear(16, 40, bias=False)
