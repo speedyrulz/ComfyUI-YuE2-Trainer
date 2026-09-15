@@ -8,15 +8,19 @@ onto module names, so the files load with the stock ``LoraLoader`` / ``LoraLoade
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import re
 
 import torch
 import torch.nn as nn
+
+from .constants import CLIP_KEY_PREFIX, MODEL_KEY_PREFIX
 
 TARGET_PRESETS = {
     "attention": ("self_attn.qkv_proj", "self_attn.o_proj", "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"),
@@ -138,5 +142,50 @@ def load_lora_file(path) -> dict:
     return safetensors.torch.load_file(str(path), device="cpu")
 
 
-__all__ = ["select_target_modules", "create_lora", "LoraSetup", "save_lora_file", "load_lora_file",
-           "count_parameters", "TARGET_PRESETS", "ACOUSTIC_EXTRA"]
+def lora_metadata(path) -> dict:
+    """The trainer metadata stored in a LoRA file (empty for files from other tools)."""
+    import safetensors
+    with safetensors.safe_open(str(path), "pt") as handle:
+        meta = handle.metadata() or {}
+    try:
+        return json.loads(meta.get("yue2_trainer", "{}"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def merge_lora_files(paths, out_path) -> tuple[dict, dict]:
+    """Write one LoRA file holding every tensor of ``paths`` (an acoustic and a planner LoRA: their keys never
+    overlap, so one Load LoRA node then applies both). Files that patch the same weight are refused."""
+    merged, parts = {}, []
+    for path in paths:
+        sd = load_lora_file(path)
+        overlap = sorted(set(sd) & set(merged))
+        if overlap:
+            raise ValueError(f"{Path(path).name} patches weights already in the merge ({overlap[0]}, ...): only LoRAs "
+                             "for different parts of the model (acoustic + planner) can be merged")
+        merged.update(sd)
+        meta = lora_metadata(path)
+        parts.append({"file": Path(path).name, "keys": len(sd), **{k: meta.get(k) for k in ("kind", "steps", "rank", "alpha", "save_name", "kept_step")}})
+    metadata = {"kind": "merged", "parts": parts,
+                "model_keys": sum(1 for k in merged if k.startswith(MODEL_KEY_PREFIX)),
+                "clip_keys": sum(1 for k in merged if k.startswith(CLIP_KEY_PREFIX))}
+    save_lora_file(merged, out_path, metadata)
+    return merged, metadata
+
+
+@contextlib.contextmanager
+def adapter_weights_as(lora, dtype):
+    """Temporarily run the LoRA adapters in ``dtype`` (ComfyUI's samplers feed the bypass hooks bf16 activations
+    and do not autocast, while the trainable weights are fp32). The fp32 tensors are put back afterwards."""
+    stash = [(param, param.data) for adapter in lora.adapters for param in adapter.parameters()]
+    try:
+        for param, data in stash:
+            param.data = data.to(dtype)
+        yield
+    finally:
+        for param, data in stash:
+            param.data = data
+
+
+__all__ = ["select_target_modules", "create_lora", "LoraSetup", "save_lora_file", "load_lora_file", "lora_metadata",
+           "merge_lora_files", "adapter_weights_as", "count_parameters", "TARGET_PRESETS", "ACOUSTIC_EXTRA"]

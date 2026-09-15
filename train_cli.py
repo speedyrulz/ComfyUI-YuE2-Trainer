@@ -206,6 +206,11 @@ def main(argv=None):
                     help="Fraction of steps trained on the unconditional (instruction-only) prefix.")
     pa.add_argument("--timestep-sampling", default="uniform", choices=["uniform", "logit_normal"])
     pa.add_argument("--shift", type=float, default=1.0)
+    pa.add_argument("--sample-every", type=int, default=0,
+                    help="Render a fixed music-token stream with the LoRA under training every N steps (0 = off).")
+    pa.add_argument("--sample-tokens", default="", help="The stream: a .semantic.npy (default: the first song with semantic tokens).")
+    pa.add_argument("--sample-seconds", type=float, default=30.0)
+    pa.add_argument("--sample-seed", type=int, default=0)
     pp = sub.add_parser("planner", help="Train the planner / semantic (CLIP) LoRA")
     add_common(pp)
     pp.add_argument("--no-abc", action="store_true", help="Do not train the ABC target.")
@@ -231,9 +236,22 @@ def main(argv=None):
     pp.add_argument("--probe-abc", default="",
                     help="Fixed ABC score for the music probes, or @file (default: the score each probe writes).")
     pp.add_argument("--probe-dir", default=None, help="Where probe scores are written (default: <out>_probes/).")
+    pp.add_argument("--probe-render", action="store_true",
+                    help="Render every music probe to step_NNNNNN.wav on --probe-render-device (needs a GPU training does not use).")
+    pp.add_argument("--probe-render-device", default="auto", help="auto (a GPU not used for training) or cuda:N.")
+    pm = sub.add_parser("merge", help="Write an acoustic and a planner LoRA into one file")
+    pm.add_argument("parts", nargs="+", help="LoRA files to merge (their keys must not overlap).")
+    pm.add_argument("--out", required=True, help="Output .safetensors path.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.command == "merge":
+        sys.path.insert(0, str(HERE))
+        from yue2_trainer.lora import merge_lora_files
+        merged, meta = merge_lora_files(args.parts, args.out)
+        print(f"merged {len(args.parts)} files -> {args.out}: {len(merged)} tensors "
+              f"({meta['model_keys']} model, {meta['clip_keys']} clip)", flush=True)
+        return 0
     bootstrap_comfy(args.comfy_root, args.models_root)
     sys.path.insert(0, str(HERE))
     import torch
@@ -288,12 +306,22 @@ def main(argv=None):
             save_state(state, state_path(target))
         logging.info("saved intermediate LoRA %s%s", target, " (+ resume state)" if state else "")
 
-    def probe_writer(step, abc, meta, music=None):
+    def probe_folder():
         folder = Path(args.probe_dir) if getattr(args, "probe_dir", None) else Path(str(Path(args.out).with_suffix("")) + "_probes")
         if not folder.is_absolute() and folder.parent == Path("."):
             import folder_paths
             folder = Path(folder_paths.get_folder_paths("loras")[0]) / folder
         folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def audio_writer(prefix):
+        def write(step, audio, rate):
+            from yue2_trainer.render import save_wav
+            return save_wav(probe_folder() / f"{prefix}_{step:06d}.wav", audio, rate)
+        return write
+
+    def probe_writer(step, abc, meta, music=None):
+        folder = probe_folder()
         target = folder / f"step_{step:06d}.abc"
         target.write_text(abc, encoding="utf-8")
         target.with_suffix(".json").write_text(json.dumps(meta, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -305,6 +333,12 @@ def main(argv=None):
     with torch.inference_mode(False):
         if args.command == "acoustic":
             from yue2_trainer.acoustic import AcousticConfig, train_acoustic_lora
+            sample = None
+            if args.sample_every > 0:
+                from yue2_trainer.render import sample_stream
+                sample = sample_stream(dataset.items, args.sample_tokens or None, args.sample_seconds)
+                if sample is None:
+                    logging.warning("--sample-every: nothing to render (give --sample-tokens or a dataset with semantic tokens)")
             cfg = AcousticConfig(steps=steps, batch_size=args.batch_size, grad_accumulation=args.grad_accumulation,
                                  learning_rate=args.lr, lr_schedule=args.lr_schedule, rank=args.rank, alpha=args.alpha, targets=args.targets,
                                  train_acoustic_head=args.train_acoustic_head, segment_seconds=args.segment_seconds,
@@ -318,8 +352,11 @@ def main(argv=None):
                                  log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
                                  eval_holdout=args.eval_holdout, keep=args.keep,
                                  tensorboard_dir=args.tensorboard or "",
-                                 run_name=args.run_name or Path(args.out).stem, save_every=args.save_every, save_callback=save_partial)
-            result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress)
+                                 run_name=args.run_name or Path(args.out).stem, save_every=args.save_every, save_callback=save_partial,
+                                 sample_every=args.sample_every if sample else 0, sample_seconds=args.sample_seconds,
+                                 sample_seed=args.sample_seed, sample_codes=sample["codes"] if sample else None,
+                                 sample_prompt=sample, sample_callback=audio_writer("sample"))
+            result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress, vae=vae)
         else:
             from yue2_trainer.dataset import scan_folder
             from yue2_trainer.planner import PlannerConfig, train_planner_lora
@@ -332,6 +369,20 @@ def main(argv=None):
             regularization = scan_folder(args.regularization) if args.regularization else None
             if regularization is not None:
                 logging.info("regularization scores:\n%s", regularization.describe())
+            render_callback = None
+            if args.probe_render and args.probe_every > 0 and args.probe_music_seconds > 0:
+                from yue2_trainer.parallel import resolve_devices
+                from yue2_trainer.render import Renderer, pick_render_device
+                target = pick_render_device(args.probe_render_device, resolve_devices(args.devices))
+                if target is None:
+                    logging.warning("--probe-render: no GPU free for rendering (training uses %s); probes stay as token files", args.devices)
+                else:
+                    renderer = Renderer(model, vae, target)
+                    write_audio = audio_writer("step")
+
+                    def render_callback(step, conditioning, frames, meta):
+                        audio, rate = renderer.render(conditioning, frames, args.probe_seed)
+                        return write_audio(step, audio, rate)
             cfg = PlannerConfig(steps=steps, batch_size=args.batch_size, grad_accumulation=args.grad_accumulation,
                                 learning_rate=args.lr, lr_schedule=args.lr_schedule, rank=args.rank, alpha=args.alpha, targets=args.targets,
                                 train_abc=not args.no_abc, train_semantic=args.semantic, abc_mode=args.abc_mode,
@@ -342,7 +393,7 @@ def main(argv=None):
                                 kl_weight=args.kl_weight, abc_dropout=args.abc_dropout,
                                 probe_every=args.probe_every, probe_style=args.probe_style, probe_lyrics=probe_lyrics,
                                 probe_max_tokens=args.probe_max_tokens, probe_seed=args.probe_seed, probe_callback=probe_writer,
-                                probe_music_seconds=args.probe_music_seconds, probe_abc=probe_abc,
+                                probe_music_seconds=args.probe_music_seconds, probe_abc=probe_abc, render_callback=render_callback,
                                 log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
                                 eval_holdout=args.eval_holdout, keep=args.keep,
                                 tensorboard_dir=args.tensorboard or "",

@@ -93,6 +93,7 @@
    "probe_max_tokens": 8192,
    "probe_seed": 0,
    "probe_abc": "",
+   "probe_render_device": "auto",
    "regularization": [
     "11",
     0

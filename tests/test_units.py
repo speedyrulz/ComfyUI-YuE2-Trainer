@@ -186,6 +186,47 @@ def test_chunked_losses_kl_matches_direct():
     assert none_kl is None and torch.allclose(only_ce, want_ce, atol=1e-5)
 
 
+def test_merge_lora_files_and_metadata(tmp_path):
+    import pytest
+    from yue2_trainer.lora import lora_metadata, merge_lora_files, save_lora_file
+    a, b = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
+    save_lora_file({"diffusion_model.x.lora_up.weight": torch.zeros(2, 2)}, a, {"kind": "acoustic", "steps": 5})
+    save_lora_file({"text_encoders.y.lora_up.weight": torch.ones(2, 2)}, b, {"kind": "planner", "steps": 7})
+    merged, meta = merge_lora_files([a, b], tmp_path / "m.safetensors")
+    assert set(merged) == {"diffusion_model.x.lora_up.weight", "text_encoders.y.lora_up.weight"}
+    assert meta["model_keys"] == 1 and meta["clip_keys"] == 1
+    assert [p["kind"] for p in meta["parts"]] == ["acoustic", "planner"] and meta["parts"][1]["steps"] == 7
+    assert lora_metadata(tmp_path / "m.safetensors")["kind"] == "merged"
+    with pytest.raises(ValueError):
+        merge_lora_files([a, a], tmp_path / "dup.safetensors")
+
+
+def test_render_helpers(tmp_path):
+    import wave
+    import yue2_trainer.render as R
+    assert R.pick_render_device("off", []) is None
+    assert R.pick_render_device("cuda:1", [torch.device("cuda:0")]) == torch.device("cuda:1")
+    assert R.pick_render_device("auto", [torch.device(d) for d in R.available_cuda_devices()]) is None
+    audio = np.stack([np.linspace(-0.5, 0.5, 480), np.zeros(480)], 1).astype(np.float32)
+    saved = R.save_wav(tmp_path / "x.wav", audio, 48000)
+    with wave.open(saved) as handle:
+        assert handle.getnchannels() == 2 and handle.getframerate() == 48000 and handle.getnframes() == 480
+    np.save(tmp_path / "step_000010.semantic.npy", np.arange(50))
+    (tmp_path / "step_000010.json").write_text(json.dumps({"style": "rock", "lyrics": "la", "music": {"abc": "X:1\nK:C\nC D|", "mode": "melody"}}))
+    got = R.tokens_and_prompt(tmp_path / "step_000010.semantic.npy", max_seconds=1.0)
+    assert got["codes"] == list(range(25)) and got["style"] == "rock" and got["mode"] == "melody" and got["abc"].startswith("X:1")
+    np.save(tmp_path / "song.semantic.npy", np.arange(10) + 151853)   # raw vocabulary ids
+    (tmp_path / "song.style.txt").write_text("jazz")
+    (tmp_path / "song.abc").write_text('X:1\nK:C\n"C"C D|')
+    got = R.tokens_and_prompt(tmp_path / "song.semantic.npy")
+    assert got["codes"] == list(range(10)) and got["style"] == "jazz" and got["mode"] == "full" and got["lyrics"] == ""
+    from yue2_trainer.dataset import Item
+    items = [Item(id="a", audio_path=None, style="s", lyrics="l"), Item(id="b", audio_path=None, style="t", lyrics="m", semantic=[1] * 100)]
+    stream = R.sample_stream(items, None, 2.0)
+    assert stream["name"] == "b" and len(stream["codes"]) == 50 and stream["mode"] == "off"
+    assert R.sample_stream(items[:1], None, 2.0) is None
+
+
 def test_chunked_cross_entropy():
     torch.manual_seed(0)
     head = nn.Linear(16, 40, bias=False)

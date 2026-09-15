@@ -64,6 +64,10 @@
    "train_acoustic_head": false,
    "timestep_sampling": "uniform",
    "shift": 1.0,
+   "sample_every": 250,
+   "sample_tokens": "",
+   "sample_seconds": 30.0,
+   "sample_seed": 0,
    "steps": 1000,
    "learning_rate": 0.0001,
    "rank": 32,
@@ -91,7 +95,11 @@
    "eval_samples": 8,
    "eval_holdout": 1,
    "resume_state": true,
-   "keep": "best_eval"
+   "keep": "best_eval",
+   "vae": [
+    "1",
+    2
+   ]
   }
  },
  "5": {

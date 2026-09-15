@@ -14,11 +14,12 @@ from .acoustic import TrainResult, _check_trainable_weights, _keep, _make_optimi
 from .constants import CLIP_KEY_PREFIX, CODEC_OFFSET, CODEC_SIZE, CONTEXT, FRAMES_PER_SECOND, MUSIC_END
 from .dataset import CHORD_RE, Dataset, Item
 from .forward import ar_hidden, chunked_cross_entropy, chunked_losses
-from .lora import create_lora, select_target_modules, count_parameters
+from .lora import adapter_weights_as, create_lora, select_target_modules, count_parameters
 from .monitor import TrainMonitor
 from .parallel import (Replica, clone_patcher_for_device, free_replicas, reduce_gradients, resolve_devices,
                        run_on_replicas, split_counts, sync_lora_weights)
 from .prefix import abc_sequence, music_prefix_ids, negative_prefix_ids, resolve_mode, load_clip_for_prefill
+from .render import conditioning_from_tokens
 from .resume import capture_state, restore_state
 
 PROBE_SAMPLING = {"temperature": 0.7, "top_p": 0.9, "top_k": 30, "repetition_penalty": 1.005}   # YuE2GenerateABC defaults
@@ -64,6 +65,7 @@ class PlannerConfig:
     probe_music_seconds: float = 0.0    # also write the music-token stream for the probe prompt, up to this many seconds (0 = off)
     probe_abc: str = ""                 # fixed score for the music probes (blank = the score each probe writes)
     probe_callback: Optional[Callable[..., Optional[str]]] = None   # (step, abc, meta, music_tokens | None) -> saved path
+    render_callback: Optional[Callable[..., Optional[str]]] = None  # (step, conditioning, frames, meta) -> audio path
     tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
     run_name: str = ""                  # TensorBoard run name (timestamp appended)
     existing_lora: Optional[dict] = None
@@ -238,34 +240,6 @@ def generate_music(clip, style: str, lyrics: str, abc: Optional[str], mode: str,
     return codes, not truncated
 
 
-def conditioning_from_tokens(clip, style: str, lyrics: str, abc: Optional[str], mode: str, codes: list) -> list:
-    """Acoustic-stage conditioning for an existing music-token stream (codebook indices 0..32767), exactly what
-    ``YuE2GenerateMusic`` would output had it sampled these tokens: the AR key/value cache over
-    prefix + tokens + MUSIC_END, chunked to the context. Returns a ComfyUI CONDITIONING list."""
-    import comfy.model_management
-    if not codes:
-        raise ValueError("No music tokens to condition on")
-    if min(codes) < 0 or max(codes) >= CODEC_SIZE:
-        raise ValueError(f"music tokens must be codebook indices 0..{CODEC_SIZE - 1}")
-    cot = mode if abc and abc.strip() and mode in ("full", "melody") else "off"
-    score = abc if cot != "off" else None
-    prefix, abc_ids = music_prefix_ids(clip, style, lyrics, score, cot)
-    tokens = clip.tokenize(style, lyrics=lyrics, cot=cot, abc=score or "", max_tokens=len(codes))
-    clip.load_model(tokens)
-    device = clip.patcher.load_device
-    te = clip.cond_stage_model
-    te.set_clip_options({"execution_device": device})
-    dtype = torch.bfloat16 if comfy.model_management.should_use_bf16(device) else torch.float32
-    device_context = getattr(comfy.model_management, "cuda_device_context", None)
-    with contextlib.ExitStack() as stack:
-        stack.enter_context(torch.no_grad())
-        if device_context is not None:
-            stack.enter_context(device_context(device))
-        cond, chunks = te._acoustic_conditioning(prefix, [int(c) + CODEC_OFFSET for c in codes], dtype)
-    return [[cond, {"pooled_output": None, "yue2_chunks": chunks, "yue2_abc_ids": abc_ids,
-                    "yue2_frames": len(codes), "yue2_truncated": False}]]
-
-
 @contextlib.contextmanager
 def _lora_off(lora):
     """Run the base model: ComfyUI's bypass hooks scale every adapter by its ``multiplier`` at call time."""
@@ -279,18 +253,7 @@ def _lora_off(lora):
             adapter.multiplier = value
 
 
-@contextlib.contextmanager
-def _adapter_weights_as(lora, dtype):
-    """Temporarily run the LoRA adapters in ``dtype`` (ComfyUI's sampler feeds the bypass hooks bf16 activations
-    and does not autocast, while the trainable weights are fp32). The fp32 tensors are put back afterwards."""
-    stash = [(param, param.data) for adapter in lora.adapters for param in adapter.parameters()]
-    try:
-        for param, data in stash:
-            param.data = data.to(dtype)
-        yield
-    finally:
-        for param, data in stash:
-            param.data = data
+_adapter_weights_as = adapter_weights_as   # ComfyUI's sampler feeds the bypass hooks bf16 activations
 
 
 def _load_clips(clip, devices: list[torch.device]):
@@ -491,6 +454,15 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
         path = cfg.probe_callback(index, text, meta, codes) if cfg.probe_callback else None
         if path:
             entry["path"] = str(path)
+        if cfg.render_callback and codes:
+            started = time.perf_counter()
+            with _adapter_weights_as(primary.lora, torch.bfloat16):
+                conditioning = conditioning_from_tokens(primary.extra["clip"], probe_style, probe_lyrics, abc, mode, codes)
+            audio_path = cfg.render_callback(index, conditioning, len(codes), meta)
+            del conditioning
+            if audio_path:
+                music["audio"] = str(audio_path)
+                music["render_seconds"] = round(time.perf_counter() - started, 1)
         probes.append(entry)
         monitor.probe(index, count, ended, seconds, path, music=music)
 

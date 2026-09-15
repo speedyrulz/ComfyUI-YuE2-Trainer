@@ -131,11 +131,17 @@ class TrainMonitor:
                 self.writer.add_scalar("probe/music_distinct", music.get("distinct", 0.0), index)
             earlier = next((p for p in self.probes[:-1] if p.get("music")), None)
             verdict = "ended on its own" if music["ended"] else f"ran the whole {music.get('budget_seconds', 0.0):.0f}-s budget"
-            LOG.info("YuE2 %s music probe step %d/%d  %d music tokens (%.1f s, %.0f%% distinct) in %s, %s%s",
+            LOG.info("YuE2 %s music probe step %d/%d  %d music tokens (%.1f s, %.0f%% distinct) in %s, %s%s%s",
                      self.kind, index, self.total, music["tokens"], music.get("seconds", 0.0),
                      music.get("distinct", 0.0) * 100.0, _fmt_seconds(music.get("generation_seconds", 0.0)), verdict,
                      f"  (step {earlier['step']}: {earlier['music']['tokens']} tokens, "
-                     f"{earlier['music'].get('distinct', 0.0) * 100:.0f}% distinct)" if earlier else "")
+                     f"{earlier['music'].get('distinct', 0.0) * 100:.0f}% distinct)" if earlier else "",
+                     f"  -> {music['audio']}" if music.get("audio") else "")
+
+    def sample(self, index: int, seconds: float, path: Optional[str], elapsed: float):
+        """An audio sample rendered with the LoRA under training at step ``index`` (0 = the base model)."""
+        LOG.info("YuE2 %s sample step %d/%d  %.1f s of audio with the %s in %s%s", self.kind, index, self.total, seconds,
+                 "base model" if index == 0 else "current LoRA", _fmt_seconds(elapsed), f"  -> {path}" if path else "")
 
     def close(self, info: Optional[dict] = None):
         if self.writer is not None:

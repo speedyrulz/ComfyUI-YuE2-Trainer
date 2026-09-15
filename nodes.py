@@ -21,7 +21,7 @@ from .yue2_trainer.acoustic import LR_SCHEDULES, AcousticConfig, train_acoustic_
 from .yue2_trainer.audio import audio_seconds, crop_audio, encode_latents, load_audio, to_stereo_48k
 from .yue2_trainer.constants import FRAMES_PER_SECOND
 from .yue2_trainer.dataset import Dataset, Item, cache_key, clone_dataset, load_cache, save_cache, scan_folder
-from .yue2_trainer.lora import TARGET_PRESETS, load_lora_file, save_lora_file
+from .yue2_trainer.lora import TARGET_PRESETS, load_lora_file, lora_metadata, merge_lora_files, save_lora_file
 from .yue2_trainer.parallel import device_choices
 from .yue2_trainer.sidecars import DEFAULT_CLAUDE, PRECISIONS, SidecarConfig, WHISPER_CHOICES, prepare_folder, summarize
 from .yue2_trainer.monitor import probe_summary
@@ -30,6 +30,7 @@ from .yue2_trainer.dataset import CHORD_RE
 from .yue2_trainer.planner import (MUSIC_SAMPLING, PROBE_SAMPLING, PlannerConfig, conditioning_from_tokens, generate_abc,
                                    generate_music, train_planner_lora)
 from .yue2_trainer.prefix import resolve_mode
+from .yue2_trainer.render import Renderer, pick_render_device, sample_stream, save_wav, tokens_and_prompt
 from .yue2_trainer.resume import load_state, save_state, state_path
 from .yue2_trainer.semantic import DEFAULT_MERT, HEAD_FILENAME, SemanticTokenizer, tokenize_dataset
 from .yue2_trainer.semantic import summarize as summarize_semantic
@@ -86,6 +87,17 @@ def _probe_writer(save_name: str):
         return str(target)
 
     return write
+
+
+def _audio_writer(folder: Path, prefix: str):
+    """Saves rendered audio as <folder>/<prefix>_000025.wav."""
+    def write(step: int, audio, rate: int):
+        return save_wav(folder / f"{prefix}_{step:06d}.wav", audio, rate)
+    return write
+
+
+def _render_device_choices():
+    return ["auto", "off"] + [d for d in device_choices() if d.startswith("cuda")]
 
 
 def _lora_choices():
@@ -514,7 +526,19 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
                 io.Combo.Input("timestep_sampling", options=["uniform", "logit_normal"], default="uniform", advanced=True),
                 io.Float.Input("shift", default=1.0, min=0.1, max=10.0, step=0.1, advanced=True,
                                tooltip="Sigma shift applied to sampled timesteps (1 = none)."),
+                io.Int.Input("sample_every", default=0, min=0, max=100000,
+                             tooltip="With the vae connected: every N steps (and before step 1) render a fixed music-token "
+                                     "stream with the LoRA under training to output/yue2_probes/<save_name>/sample_NNNNNN.wav. "
+                                     "Step 0 is the base model on the same tokens, so what changes is the LoRA. 0 = off."),
+                io.String.Input("sample_tokens", default="",
+                                tooltip="The stream to render: a .semantic.npy (a probe's, or a song's sidecar; absolute or "
+                                        "relative to ComfyUI/output). Blank = the first training song's semantic tokens with "
+                                        "its own style, lyrics and score."),
+                io.Float.Input("sample_seconds", default=30.0, min=0.0, max=900.0, step=1.0,
+                               tooltip="Render only the first N seconds of the stream (0 = all)."),
+                io.Int.Input("sample_seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF, advanced=True),
                 *_common_training_inputs(1e-4, 300),
+                io.Vae.Input("vae", optional=True, tooltip="VAE from the checkpoint; needed for sample_every."),
             ],
             outputs=[LORA_MODEL.Output("lora", display_name="lora"), LOSS_MAP.Output("loss_map", display_name="loss_map"),
                      io.Int.Output("steps", display_name="steps"), io.String.Output("report", display_name="report")],
@@ -522,10 +546,21 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, clip, dataset, segment_seconds, conditioning, prefix_mode, use_semantic_tokens, train_acoustic_head,
-                caption_dropout, timestep_sampling, shift, steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
+                caption_dropout, timestep_sampling, shift, sample_every, sample_tokens, sample_seconds, sample_seed,
+                steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
                 existing_lora, resume_state, save_every, save_name, log_every, eval_every, eval_samples, eval_holdout,
-                keep, tensorboard, tensorboard_dir):
+                keep, tensorboard, tensorboard_dir, vae=None):
+        sample = None
+        if sample_every > 0:
+            if vae is None:
+                logging.warning("YuE2 trainer: sample_every needs the vae input; no samples will be rendered")
+            else:
+                path = str(_output_file(sample_tokens)) if sample_tokens.strip() else None
+                sample = sample_stream(dataset.items, path, sample_seconds)
+                if sample is None:
+                    logging.warning("YuE2 trainer: nothing to render for sample_every (no sample_tokens file and no song "
+                                    "with semantic tokens); no samples will be rendered")
         cfg = AcousticConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             lr_schedule=lr_schedule,
@@ -539,6 +574,9 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             resume_state=_resume_state(existing_lora, resume_state), keep=keep,
             log_every=log_every, eval_every=eval_every, eval_samples=eval_samples, eval_holdout=eval_holdout,
             tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
+            sample_every=sample_every if sample else 0, sample_seconds=sample_seconds, sample_seed=sample_seed,
+            sample_codes=sample["codes"] if sample else None, sample_prompt=sample,
+            sample_callback=_audio_writer(_probe_dir(save_name), "sample"),
         )
         cfg.save_callback = lambda sd, n, info, state=None: _save_checkpoint(sd, save_name, n, {**info, "save_name": save_name}, state)
         pbar = comfy.utils.ProgressBar(steps)
@@ -547,7 +585,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             pbar.update_absolute(done, total)
 
         with torch.inference_mode(False):
-            result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress, interrupt_check=_interrupt)
+            result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress, interrupt_check=_interrupt, vae=vae)
         result.info["save_name"] = save_name
         report = _report(result)
         return io.NodeOutput(result.lora_sd, _loss_map(result), result.steps, report)
@@ -617,11 +655,18 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
                                 tooltip="Fixed ABC score for the music probes, so every checkpoint is measured on the same "
                                         "score (blank = the score each probe writes; if that one did not end, the first "
                                         "training song's score)."),
+                io.Combo.Input("probe_render_device", options=_render_device_choices(), default="auto",
+                               tooltip="With model and vae connected: render every music probe to audio "
+                                       "(step_NNNNNN.wav next to its tokens) on this GPU. auto = a GPU training does not "
+                                       "use; the acoustic model does not fit next to the planner and its training state on "
+                                       "a 16 GB card, so with one GPU render afterwards with YuE2 Conditioning From Tokens."),
                 *_common_training_inputs(5e-5, 100),
                 DATASET.Input("regularization", optional=True,
                               tooltip="Scores the BASE model wrote (YuE2 Regularization Scores node, or a folder of YuE2 "
                                       "output directories). Mixed into training at regularization_fraction so the "
                                       "LoRA does not forget how to write and end a score."),
+                io.Model.Input("model", optional=True, tooltip="MODEL from the checkpoint: with vae, renders the music probes."),
+                io.Vae.Input("vae", optional=True, tooltip="VAE from the checkpoint: with model, renders the music probes."),
             ],
             outputs=[LORA_MODEL.Output("lora", display_name="lora"), LOSS_MAP.Output("loss_map", display_name="loss_map"),
                      io.Int.Output("steps", display_name="steps"), io.String.Output("report", display_name="report")],
@@ -631,11 +676,26 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
     def execute(cls, clip, dataset, train_abc, train_semantic, abc_mode, max_tokens, regularization_fraction,
                 kl_weight, abc_dropout,
                 probe_every, probe_style, probe_lyrics, probe_music_seconds, probe_max_tokens, probe_seed, probe_abc,
-                steps, learning_rate, lr_schedule,
+                probe_render_device, steps, learning_rate, lr_schedule,
                 rank, alpha,
                 targets, batch_size, grad_accumulation, warmup_steps, seed, optimizer, lora_dtype,
                 gradient_checkpointing, max_grad_norm, devices, existing_lora, resume_state, save_every, save_name, log_every,
-                eval_every, eval_samples, eval_holdout, keep, tensorboard, tensorboard_dir, regularization=None):
+                eval_every, eval_samples, eval_holdout, keep, tensorboard, tensorboard_dir, regularization=None,
+                model=None, vae=None):
+        render_callback = None
+        if model is not None and vae is not None and probe_every > 0 and probe_music_seconds > 0:
+            target = pick_render_device(probe_render_device, resolve_devices(devices))
+            if target is None:
+                logging.warning("YuE2 trainer: no GPU free for rendering the music probes (training uses %s, "
+                                "probe_render_device=%s); render them afterwards with YuE2 Conditioning From Tokens",
+                                devices, probe_render_device)
+            else:
+                renderer = Renderer(model, vae, target)
+                write_audio = _audio_writer(_probe_dir(save_name), "step")
+
+                def render_callback(step, conditioning, frames, meta):
+                    audio, rate = renderer.render(conditioning, frames, probe_seed)
+                    return write_audio(step, audio, rate)
         cfg = PlannerConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             lr_schedule=lr_schedule,
@@ -647,7 +707,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
             regularization_fraction=regularization_fraction, kl_weight=kl_weight, abc_dropout=abc_dropout,
             probe_every=probe_every, probe_style=probe_style, probe_lyrics=probe_lyrics,
             probe_max_tokens=probe_max_tokens, probe_seed=probe_seed, probe_callback=_probe_writer(save_name),
-            probe_music_seconds=probe_music_seconds, probe_abc=probe_abc,
+            probe_music_seconds=probe_music_seconds, probe_abc=probe_abc, render_callback=render_callback,
             log_every=log_every, eval_every=eval_every, eval_samples=eval_samples, eval_holdout=eval_holdout,
             tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
@@ -667,7 +727,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
 
 def _loss_map(result) -> dict:
     out = {"loss": result.losses, "eval": result.evals, "info": result.info}
-    for key in ("drift", "probe", "kl"):
+    for key in ("drift", "probe", "kl", "samples"):
         if result.info.get(key):
             out[key] = result.info[key]
     if getattr(result, "state", None):
@@ -703,9 +763,15 @@ def _report(result) -> str:
                                             for p in probes))
         if probes[-1].get("path"):
             lines.append(f"probe scores: {Path(probes[-1]['path']).parent}")
+    samples = result.info.get("samples") or []
+    if samples:
+        lines.append("rendered samples: " + "; ".join(f"step {s['step']}: {s['seconds']} s" for s in samples))
+        if samples[-1].get("path"):
+            lines.append(f"samples: {Path(samples[-1]['path']).parent}")
     if result.info.get("tensorboard"):
         lines.append(f"tensorboard run: {result.info['tensorboard']}")
-    lines.append(json.dumps({k: v for k, v in result.info.items() if k not in ("eval", "drift", "probe", "kl")}, ensure_ascii=False))
+    lines.append(json.dumps({k: v for k, v in result.info.items() if k not in ("eval", "drift", "probe", "kl", "samples")},
+                            ensure_ascii=False))
     return "\n".join(lines)
 
 
@@ -879,14 +945,6 @@ def _output_file(path: str) -> Path:
     return p
 
 
-def _sidecar_text(base: Path, *names: str) -> str:
-    for name in names:
-        p = Path(str(base) + name)
-        if p.is_file():
-            return p.read_text(encoding="utf-8")
-    return ""
-
-
 class YuE2TrainerTokensConditioning(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -920,24 +978,8 @@ class YuE2TrainerTokensConditioning(io.ComfyNode):
     @classmethod
     def execute(cls, clip, tokens, style, lyrics, abc, mode, max_seconds):
         path = _output_file(tokens)
-        codes = [int(c) for c in np.load(path, allow_pickle=False).reshape(-1).tolist()]
-        if codes and max(codes) >= CODEC_SIZE:      # raw vocabulary ids are accepted too
-            codes = [c - CODEC_OFFSET for c in codes]
-        name = path.name[:-len(".semantic.npy")] if path.name.endswith(".semantic.npy") else path.stem
-        base = path.parent / name
-        meta = {}
-        meta_path = Path(str(base) + ".json")
-        if meta_path.is_file():
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        music = meta.get("music") or {}
-        style = style.strip() or meta.get("style", "") or _sidecar_text(base, ".style.txt", ".tags.txt").strip()
-        lyrics = lyrics if lyrics.strip() else (meta.get("lyrics") or _sidecar_text(base, ".lyrics.txt", ".txt"))
-        if not abc.strip():
-            abc = music.get("abc") if "abc" in music else (meta.get("abc") if isinstance(meta.get("abc"), str) else "") or _sidecar_text(base, ".abc")
-        if mode == "auto":
-            mode = music.get("mode") or resolve_mode("auto", abc, bool(abc and CHORD_RE.search(abc)))
-        if max_seconds > 0:
-            codes = codes[: max(1, round(max_seconds * FRAMES_PER_SECOND))]
+        got = tokens_and_prompt(path, style, lyrics, abc, mode, max_seconds)
+        codes, style, lyrics, abc, mode = got["codes"], got["style"], got["lyrics"], got["abc"], got["mode"]
         with torch.inference_mode():
             conditioning = conditioning_from_tokens(clip, style, lyrics, abc, mode, codes)
         seconds = len(codes) / FRAMES_PER_SECOND
@@ -945,6 +987,40 @@ class YuE2TrainerTokensConditioning(io.ComfyNode):
                 f"{len(set(codes)) / max(1, len(codes)) * 100:.0f}% distinct, style {style[:60]!r}")
         logging.info("YuE2 trainer: %s", info)
         return io.NodeOutput(conditioning, seconds, info)
+
+
+class YuE2TrainerMergeLoRA(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="YuE2TrainerMergeLoRA",
+            display_name="YuE2 Merge LoRAs",
+            category=CATEGORY,
+            description="Writes an acoustic LoRA and a planner LoRA into one file (their keys never overlap), so a "
+                        "single YuE2 Load LoRA node with both model and clip connected applies both. Saved to "
+                        "models/loras/<name>.safetensors with both trainings' metadata.",
+            inputs=[
+                io.Combo.Input("lora_a", options=folder_paths.get_filename_list("loras"), tooltip="Typically the acoustic LoRA."),
+                io.Combo.Input("lora_b", options=folder_paths.get_filename_list("loras"), tooltip="Typically the planner LoRA."),
+                io.String.Input("name", default="yue2_merged"),
+                io.Boolean.Input("add_timestamp", default=False),
+            ],
+            outputs=[io.String.Output(display_name="path"), io.String.Output(display_name="report")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, lora_a, lora_b, name, add_timestamp):
+        safe = "".join(c for c in name.strip() if c not in '\\/:*?"<>|') or "yue2_merged"
+        if add_timestamp:
+            safe += "_" + _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = _lora_dir() / f"{safe}.safetensors"
+        paths = [folder_paths.get_full_path_or_raise("loras", lora_a), folder_paths.get_full_path_or_raise("loras", lora_b)]
+        merged, meta = merge_lora_files(paths, target)
+        report = (f"{target.name}: {len(merged)} tensors ({meta['model_keys']} model, {meta['clip_keys']} clip) from "
+                  + " + ".join(f"{p['file']} ({p.get('kind') or 'unknown'}, {p['keys']} tensors)" for p in meta["parts"]))
+        logging.info("YuE2 trainer: merged %s", report)
+        return io.NodeOutput(str(target), report)
 
 
 class YuE2TrainerLoadLoRA(io.ComfyNode):
@@ -988,5 +1064,6 @@ class YuE2TrainerExtension(ComfyExtension):
             YuE2TrainerRegularizationScores,
             YuE2TrainerSaveLoRA,
             YuE2TrainerLoadLoRA,
+            YuE2TrainerMergeLoRA,
             YuE2TrainerTokensConditioning,
         ]

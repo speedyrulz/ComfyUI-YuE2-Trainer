@@ -14,13 +14,14 @@ import torch.nn as nn
 from .constants import FRAMES_PER_SECOND, LATENT_CHANNELS, MODEL_KEY_PREFIX, CONTEXT
 from .dataset import Dataset, Item
 from .forward import nar_forward
-from .lora import create_lora, select_target_modules, count_parameters
+from .lora import adapter_weights_as, create_lora, select_target_modules, count_parameters
 from .monitor import TrainMonitor
 from .parallel import (Replica, clone_patcher_for_device, free_replicas, reduce_gradients, resolve_devices,
                        run_on_replicas, split_counts, sync_lora_weights)
 from .constants import MUSIC_END
 from .prefix import (PrefixCache, build_acoustic_prefix, compute_prefix_kv, load_clip_for_prefill, music_prefix_ids,
                      negative_prefix_ids, resolve_mode)
+from .render import conditioning_from_tokens, decode_audio, sample_latents
 from .resume import capture_state, restore_state
 
 
@@ -63,6 +64,12 @@ class AcousticConfig:
     resume_state: Optional[dict] = None   # optimizer / RNG / step state saved next to existing_lora
     save_every: int = 0
     save_callback: Optional[Callable] = None   # (lora_sd, step, info, state)
+    sample_every: int = 0               # render sample_codes with the current LoRA every N steps (0 = off; needs a VAE)
+    sample_seconds: float = 30.0
+    sample_seed: int = 0
+    sample_codes: Optional[list] = None      # music tokens (codebook indices) of the rendered stream
+    sample_prompt: Optional[dict] = None     # style / lyrics / abc / mode the stream was written under
+    sample_callback: Optional[Callable] = None   # (step, audio [N, C] float32, rate) -> saved path
 
 
 @dataclass
@@ -305,15 +312,17 @@ def _load_patchers(model_patcher, devices: list[torch.device]):
 
 
 def _check_trainable_weights(module):
-    """Refuse quantized checkpoints (e.g. yue2_3b_int8_convrot): their weights cannot back-propagate."""
+    """The base weights stay frozen; a quantized checkpoint (yue2_3b_int8_convrot) is allowed: ComfyUI's quantized
+    linears back-propagate to their inputs, which is all the bypass LoRA needs."""
     weight = next(iter(p for n, p in module.named_parameters() if n.endswith("qkv_proj.weight")), None)
     if weight is None:
         return
-    dtype = weight.dtype
-    quantized = type(weight).__name__ != "Parameter" or dtype not in (torch.bfloat16, torch.float16, torch.float32)
+    if weight.requires_grad:
+        raise ValueError("The base model's weights must be frozen before LoRA training")
+    quantized = type(weight).__name__ != "Parameter" or weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
     if quantized:
-        raise ValueError(f"The loaded YuE2 checkpoint has quantized weights ({type(weight).__name__}, {dtype}); "
-                         "training needs the bf16 checkpoint (yue2_3b_bf16.safetensors).")
+        logging.info("YuE2 trainer: training on a quantized checkpoint (%s); the LoRA trains in %s through ComfyUI's "
+                     "quantized layers (less VRAM, slower steps)", type(weight).__name__, "bf16")
 
 
 def _setup_replicas(patchers, devices: list[torch.device], cfg: AcousticConfig, lora_dtype) -> list[Replica]:
@@ -336,7 +345,7 @@ def _setup_replicas(patchers, devices: list[torch.device], cfg: AcousticConfig, 
 
 def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConfig,
                         progress: Optional[Callable[[int, int, float], None]] = None,
-                        interrupt_check: Optional[Callable[[], None]] = None) -> TrainResult:
+                        interrupt_check: Optional[Callable[[], None]] = None, vae=None) -> TrainResult:
     import comfy.model_management
 
     start_time = time.perf_counter()
@@ -345,6 +354,19 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
 
     # 1. AR prefix caches via CLIP (then free it to make room for the acoustic model).
     samples = prepare_samples(clip, dataset, cfg)
+    sample_cond = None
+    if cfg.sample_every > 0 and cfg.sample_codes and vae is not None:
+        prompt = cfg.sample_prompt or {}
+        with torch.no_grad():
+            cond = conditioning_from_tokens(clip, prompt.get("style", ""), prompt.get("lyrics", ""), prompt.get("abc"),
+                                            prompt.get("mode", "off"), list(cfg.sample_codes))
+        sample_cond = [[cond[0][0].to("cpu"), cond[0][1]]]
+        del cond
+        logging.info("YuE2 trainer: a %.1f-s stream (%s) will be rendered with the LoRA every %d steps",
+                     len(cfg.sample_codes) / FRAMES_PER_SECOND, prompt.get("name") or "sample", cfg.sample_every)
+    elif cfg.sample_every > 0:
+        logging.warning("YuE2 trainer: sample_every is set but %s; no samples will be rendered",
+                        "no VAE was given" if vae is None else "there is no token stream to render")
     held = split_holdout([s.item.id for s in samples], cfg.eval_holdout, cfg.seed) if cfg.eval_every > 0 else set()
     eval_pool = [s for s in samples if s.item.id in held] if held else samples
     if held:
@@ -374,12 +396,14 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     seg_frames = int(round(cfg.segment_seconds * FRAMES_PER_SECOND)) if cfg.segment_seconds > 0 else 0
     eval_set = build_eval_set([s.chunk for s in eval_pool], cfg, seg_frames, cfg.seed)
     losses: list[float] = []
+    samples_log: list[dict] = []
     evals: list[list] = []
     start_step = 0
     restored = restore_state(cfg.resume_state, "acoustic", cfg, optimizer, replicas) if cfg.resume_state else None
     if restored:
         start_step = int(restored["step"])
         losses, evals = list(restored["losses"]), [list(e) for e in restored["evals"]]
+        samples_log = list(restored.get("samples", []))
         if start_step >= cfg.steps:
             raise ValueError(f"The resumed run is already at step {start_step}; set steps above it to continue "
                              "(or turn resume_state off to start a new run from the LoRA weights)")
@@ -392,7 +416,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             "shift": cfg.shift, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule, "mode": cfg.mode,
             "caption_dropout": cfg.caption_dropout, "conditioning": cfg.conditioning,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
-            "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids))}
+            "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids)),
+            "sample_every": cfg.sample_every if sample_cond is not None else 0, "samples": samples_log}
 
     monitor = TrainMonitor("acoustic", cfg.steps, cfg.log_every, cfg.tensorboard_dir or None, cfg.run_name,
                            config={k: v for k, v in vars(cfg).items()
@@ -444,12 +469,26 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             best.update(step=index, eval=value, lora_sd=primary.lora.export(), state=state_at(index))
 
     def state_at(step: int) -> dict:
-        return capture_state("acoustic", cfg, step, optimizer, replicas, losses, evals)
+        return capture_state("acoustic", cfg, step, optimizer, replicas, losses, evals, extra={"samples": samples_log})
+
+    def run_sample(index: int):
+        started = time.perf_counter()
+        frames = len(cfg.sample_codes)
+        with adapter_weights_as(primary.lora, torch.bfloat16):
+            latents = sample_latents(primary.extra["patcher"], sample_cond, frames, cfg.sample_seed)
+        audio, rate = decode_audio(vae, latents, primary.device)
+        del latents
+        path = cfg.sample_callback(index, audio, rate) if cfg.sample_callback else None
+        samples_log.append({"step": index, "seconds": round(frames / FRAMES_PER_SECOND, 1), "path": str(path) if path else None})
+        monitor.sample(index, frames / FRAMES_PER_SECOND, path, time.perf_counter() - started)
+        comfy.model_management.soft_empty_cache()
 
     final_state = None
     try:
         if eval_set and not (evals and evals[-1][0] == start_step):
             run_eval(start_step)
+        if sample_cond is not None and not (samples_log and samples_log[-1]["step"] == start_step):
+            run_sample(start_step)
         for step in range(start_step, cfg.steps):
             if interrupt_check is not None:
                 interrupt_check()
@@ -466,6 +505,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             monitor.step(step + 1, step_loss, optimizer.param_groups[0]["lr"], grad_norm)
             if eval_set and ((step + 1) % cfg.eval_every == 0 or step + 1 == cfg.steps):
                 run_eval(step + 1)
+            if sample_cond is not None and ((step + 1) % cfg.sample_every == 0 or step + 1 == cfg.steps):
+                run_sample(step + 1)
             if progress is not None:
                 progress(step + 1, cfg.steps, step_loss)
             if cfg.save_every and cfg.save_callback and (step + 1) % cfg.save_every == 0 and step + 1 < cfg.steps:
