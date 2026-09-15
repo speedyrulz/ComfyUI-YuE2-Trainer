@@ -14,7 +14,15 @@
    "model": [
     "1",
     0
-   ],
+   ]
+  }
+ },
+ "17": {
+  "class_type": "YuE2TrainerLoadLoRA",
+  "inputs": {
+   "lora_name": "yue2_semantic_planner.safetensors",
+   "strength_model": 1.0,
+   "strength_clip": 1.0,
    "clip": [
     "1",
     1
@@ -25,7 +33,7 @@
   "class_type": "YuE2GenerateABC",
   "inputs": {
    "clip": [
-    "2",
+    "17",
     1
    ],
    "style": "English, warm piano pop, expressive female voice, acoustic piano, rounded bass and light drums, 88 BPM",
@@ -63,7 +71,7 @@
   "class_type": "YuE2GenerateMusic",
   "inputs": {
    "clip": [
-    "2",
+    "17",
     1
    ],
    "style": "English, warm piano pop, expressive female voice, acoustic piano, rounded bass and light drums, 88 BPM",
