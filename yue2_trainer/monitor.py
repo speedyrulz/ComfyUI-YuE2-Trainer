@@ -76,8 +76,9 @@ class TrainMonitor:
                 self.writer.add_scalar(key, value, index)
         if index % self.log_every == 0 or index == 1 or index == self.total:
             grad = f" grad {grad_norm:.3f}" if grad_norm is not None and math.isfinite(grad_norm) else ""
-            LOG.info("YuE2 %s step %d/%d  loss %.4f  avg%d %.4f  lr %.2e%s  elapsed %s  eta %s",
-                     self.kind, index, self.total, loss, self.window, avg, lr, grad,
+            more = "".join(f"  {key.split('/')[-1]} {value:.4f}" for key, value in (extra or {}).items())
+            LOG.info("YuE2 %s step %d/%d  loss %.4f  avg%d %.4f  lr %.2e%s%s  elapsed %s  eta %s",
+                     self.kind, index, self.total, loss, self.window, avg, lr, grad, more,
                      _fmt_seconds(elapsed), _fmt_seconds(eta))
 
     def eval(self, index: int, loss: float, drift: Optional[float] = None):

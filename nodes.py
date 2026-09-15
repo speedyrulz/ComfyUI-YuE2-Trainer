@@ -25,7 +25,11 @@ from .yue2_trainer.lora import TARGET_PRESETS, load_lora_file, save_lora_file
 from .yue2_trainer.parallel import device_choices
 from .yue2_trainer.sidecars import DEFAULT_CLAUDE, PRECISIONS, SidecarConfig, WHISPER_CHOICES, prepare_folder, summarize
 from .yue2_trainer.monitor import probe_summary
-from .yue2_trainer.planner import MUSIC_SAMPLING, PROBE_SAMPLING, PlannerConfig, generate_abc, generate_music, train_planner_lora
+from .yue2_trainer.constants import CODEC_OFFSET, CODEC_SIZE
+from .yue2_trainer.dataset import CHORD_RE
+from .yue2_trainer.planner import (MUSIC_SAMPLING, PROBE_SAMPLING, PlannerConfig, conditioning_from_tokens, generate_abc,
+                                   generate_music, train_planner_lora)
+from .yue2_trainer.prefix import resolve_mode
 from .yue2_trainer.resume import load_state, save_state, state_path
 from .yue2_trainer.semantic import DEFAULT_MERT, HEAD_FILENAME, SemanticTokenizer, tokenize_dataset
 from .yue2_trainer.semantic import summarize as summarize_semantic
@@ -578,6 +582,16 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
                                        "its base-model scores instead of your songs. Keeps the planner writing "
                                        "well-formed, normal-length scores while it picks up the album's style. "
                                        "Ignored when nothing is connected."),
+                io.Float.Input("kl_weight", default=0.0, min=0.0, max=10.0, step=0.01,
+                               tooltip="Trust region: adds kl_weight x KL(base || LoRA) of the next-token distributions on "
+                                       "every trained position, with the base model computed by switching the LoRA off. "
+                                       "Holds the planner close to base-model writing on your own songs without extra "
+                                       "data (complements the regularization scores). 0 = off; 0.5-1 is a normal "
+                                       "setting. Costs one extra no-gradient forward per micro-step."),
+                io.Float.Input("abc_dropout", default=0.0, min=0.0, max=0.9, step=0.05,
+                               tooltip="train_semantic only: share of the music-token draws trained behind the no-sheet "
+                                       "prompt (what YuE2GenerateMusic runs with an empty ABC input), so one LoRA also "
+                                       "serves generation without a score. 0 = always with the sheet."),
                 io.Int.Input("probe_every", default=0, min=0, max=100000,
                              tooltip="Every N steps (and before step 1), write a whole ABC score with the current LoRA "
                                      "through YuE2's own sampler and report its length and whether it ended. A probe "
@@ -615,6 +629,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, dataset, train_abc, train_semantic, abc_mode, max_tokens, regularization_fraction,
+                kl_weight, abc_dropout,
                 probe_every, probe_style, probe_lyrics, probe_music_seconds, probe_max_tokens, probe_seed, probe_abc,
                 steps, learning_rate, lr_schedule,
                 rank, alpha,
@@ -629,7 +644,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
             resume_state=_resume_state(existing_lora, resume_state), keep=keep,
-            regularization_fraction=regularization_fraction,
+            regularization_fraction=regularization_fraction, kl_weight=kl_weight, abc_dropout=abc_dropout,
             probe_every=probe_every, probe_style=probe_style, probe_lyrics=probe_lyrics,
             probe_max_tokens=probe_max_tokens, probe_seed=probe_seed, probe_callback=_probe_writer(save_name),
             probe_music_seconds=probe_music_seconds, probe_abc=probe_abc,
@@ -652,7 +667,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
 
 def _loss_map(result) -> dict:
     out = {"loss": result.losses, "eval": result.evals, "info": result.info}
-    for key in ("drift", "probe"):
+    for key in ("drift", "probe", "kl"):
         if result.info.get(key):
             out[key] = result.info[key]
     if getattr(result, "state", None):
@@ -678,6 +693,10 @@ def _report(result) -> str:
     drift = result.info.get("drift") or []
     if len(drift) > 1:
         lines.append(f"regularizer loss (base-model scores): {drift[0][1]:.4f} -> {drift[-1][1]:.4f}")
+    kls = result.info.get("kl") or []
+    if kls:
+        lines.append(f"KL to the base model (weight {result.info.get('kl_weight', 0)}): first10={sum(kls[:10]) / len(kls[:10]):.4f} "
+                     f"last10={sum(kls[-10:]) / len(kls[-10:]):.4f} max={max(kls):.4f}")
     probes = result.info.get("probe") or []
     if probes:
         lines.append("probes: " + "; ".join(probe_summary(p).replace("(budget hit)", "(BUDGET HIT, did not end)")
@@ -686,7 +705,7 @@ def _report(result) -> str:
             lines.append(f"probe scores: {Path(probes[-1]['path']).parent}")
     if result.info.get("tensorboard"):
         lines.append(f"tensorboard run: {result.info['tensorboard']}")
-    lines.append(json.dumps({k: v for k, v in result.info.items() if k not in ("eval", "drift", "probe")}, ensure_ascii=False))
+    lines.append(json.dumps({k: v for k, v in result.info.items() if k not in ("eval", "drift", "probe", "kl")}, ensure_ascii=False))
     return "\n".join(lines)
 
 
@@ -851,6 +870,83 @@ class YuE2TrainerRegularizationScores(io.ComfyNode):
         return io.NodeOutput(Dataset(items=items, meta={"folder": str(root), "kind": "regularization"}), report)
 
 
+def _output_file(path: str) -> Path:
+    p = Path(path.strip().strip('"'))
+    if not p.is_absolute():
+        p = Path(folder_paths.get_output_directory()) / p
+    if not p.is_file():
+        raise FileNotFoundError(f"Token file not found: {p}")
+    return p
+
+
+def _sidecar_text(base: Path, *names: str) -> str:
+    for name in names:
+        p = Path(str(base) + name)
+        if p.is_file():
+            return p.read_text(encoding="utf-8")
+    return ""
+
+
+class YuE2TrainerTokensConditioning(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="YuE2TrainerTokensConditioning",
+            display_name="YuE2 Conditioning From Tokens",
+            category=CATEGORY,
+            description="Acoustic-stage conditioning for a saved music-token stream, in place of YuE2 Generate Music: "
+                        "render a probe's step_NNNNNN.semantic.npy to hear what a checkpoint wrote, or a song's "
+                        ".semantic.npy sidecar to hear the tokenizer round trip. Feed the outputs to Empty YuE2 Latent "
+                        "Audio and the KSampler as usual. With a probe file, style, lyrics and score default to the "
+                        "ones the probe used (its .json); with a dataset sidecar, to the song's own sidecars.",
+            inputs=[
+                io.Clip.Input("clip", tooltip="CLIP from the checkpoint, with the same LoRA the tokens were written with."),
+                io.String.Input("tokens", default="yue2_probes/yue2_semantic_planner/step_000030.semantic.npy",
+                                tooltip="A .semantic.npy file: absolute, or relative to ComfyUI/output."),
+                io.String.Input("style", default="", multiline=True, tooltip="Blank = the probe's / song's style prompt."),
+                io.String.Input("lyrics", default="", multiline=True, tooltip="Blank = the probe's / song's lyrics."),
+                io.String.Input("abc", default="", multiline=True,
+                                tooltip="Score the tokens were written under (blank = the probe's / song's score)."),
+                io.Combo.Input("mode", options=["auto", "full", "melody", "off"], default="auto",
+                               tooltip="Planning mode of the prompt; auto = the probe's, else full/melody by the score "
+                                       "(off without a score)."),
+                io.Float.Input("max_seconds", default=0.0, min=0.0, max=900.0, step=1.0,
+                               tooltip="Render only the first N seconds of the stream (0 = all)."),
+            ],
+            outputs=[io.Conditioning.Output(display_name="conditioning"), io.Float.Output(display_name="seconds"),
+                     io.String.Output(display_name="info")],
+        )
+
+    @classmethod
+    def execute(cls, clip, tokens, style, lyrics, abc, mode, max_seconds):
+        path = _output_file(tokens)
+        codes = [int(c) for c in np.load(path, allow_pickle=False).reshape(-1).tolist()]
+        if codes and max(codes) >= CODEC_SIZE:      # raw vocabulary ids are accepted too
+            codes = [c - CODEC_OFFSET for c in codes]
+        name = path.name[:-len(".semantic.npy")] if path.name.endswith(".semantic.npy") else path.stem
+        base = path.parent / name
+        meta = {}
+        meta_path = Path(str(base) + ".json")
+        if meta_path.is_file():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        music = meta.get("music") or {}
+        style = style.strip() or meta.get("style", "") or _sidecar_text(base, ".style.txt", ".tags.txt").strip()
+        lyrics = lyrics if lyrics.strip() else (meta.get("lyrics") or _sidecar_text(base, ".lyrics.txt", ".txt"))
+        if not abc.strip():
+            abc = music.get("abc") if "abc" in music else (meta.get("abc") if isinstance(meta.get("abc"), str) else "") or _sidecar_text(base, ".abc")
+        if mode == "auto":
+            mode = music.get("mode") or resolve_mode("auto", abc, bool(abc and CHORD_RE.search(abc)))
+        if max_seconds > 0:
+            codes = codes[: max(1, round(max_seconds * FRAMES_PER_SECOND))]
+        with torch.inference_mode():
+            conditioning = conditioning_from_tokens(clip, style, lyrics, abc, mode, codes)
+        seconds = len(codes) / FRAMES_PER_SECOND
+        info = (f"{path.name}: {len(codes)} tokens ({seconds:.1f} s), mode {mode if abc and abc.strip() else 'off'}, "
+                f"{len(set(codes)) / max(1, len(codes)) * 100:.0f}% distinct, style {style[:60]!r}")
+        logging.info("YuE2 trainer: %s", info)
+        return io.NodeOutput(conditioning, seconds, info)
+
+
 class YuE2TrainerLoadLoRA(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -892,4 +988,5 @@ class YuE2TrainerExtension(ComfyExtension):
             YuE2TrainerRegularizationScores,
             YuE2TrainerSaveLoRA,
             YuE2TrainerLoadLoRA,
+            YuE2TrainerTokensConditioning,
         ]

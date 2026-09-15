@@ -127,20 +127,40 @@ def ar_hidden(llm, ids: torch.Tensor, dtype, checkpointing: bool = True) -> torc
     return llm.norm(x) if llm.norm is not None else x
 
 
-def chunked_cross_entropy(lm_head, hidden: torch.Tensor, targets: torch.Tensor, chunk: int = 512) -> torch.Tensor:
-    """Mean CE over ``hidden`` [N, H] -> ``targets`` [N] without materialising all logits."""
-    def piece(h, t):
-        return F.cross_entropy(lm_head(h).float(), t, reduction="sum")
-    total = hidden.new_zeros((), dtype=torch.float32)
+def chunked_losses(lm_head, hidden: torch.Tensor, targets: torch.Tensor, base_hidden: Optional[torch.Tensor] = None,
+                   chunk: int = 512):
+    """Mean next-token CE over ``hidden`` [N, H] -> ``targets`` [N], and, when ``base_hidden`` [N, H] (the same
+    positions from the same model with the LoRA switched off) is given, the mean KL(base || current) of the
+    next-token distributions. Neither materialises all logits at once; each chunk is recomputed in backward.
+    Returns (ce, kl), kl None without ``base_hidden``."""
+    def piece(h, t, bh):
+        logits = lm_head(h).float()
+        ce = F.cross_entropy(logits, t, reduction="sum")
+        if bh is None:
+            return ce, ce.new_zeros(())
+        with torch.no_grad():
+            base_logp = F.log_softmax(lm_head(bh).float(), dim=-1)
+        kl = F.kl_div(F.log_softmax(logits, dim=-1), base_logp, log_target=True, reduction="sum")
+        return ce, kl
+    ce_total = hidden.new_zeros((), dtype=torch.float32)
+    kl_total = hidden.new_zeros((), dtype=torch.float32)
     n = hidden.shape[0]
     for start in range(0, n, chunk):
         h, t = hidden[start:start + chunk], targets[start:start + chunk]
+        bh = None if base_hidden is None else base_hidden[start:start + chunk]
         if torch.is_grad_enabled():
-            total = total + torch.utils.checkpoint.checkpoint(piece, h, t, use_reentrant=False)
+            ce, kl = torch.utils.checkpoint.checkpoint(piece, h, t, bh, use_reentrant=False)
         else:
-            total = total + piece(h, t)
-    return total / max(1, n)
+            ce, kl = piece(h, t, bh)
+        ce_total = ce_total + ce
+        kl_total = kl_total + kl
+    return ce_total / max(1, n), (kl_total / max(1, n) if base_hidden is not None else None)
+
+
+def chunked_cross_entropy(lm_head, hidden: torch.Tensor, targets: torch.Tensor, chunk: int = 512) -> torch.Tensor:
+    """Mean CE over ``hidden`` [N, H] -> ``targets`` [N] without materialising all logits."""
+    return chunked_losses(lm_head, hidden, targets, None, chunk)[0]
 
 
 __all__ = ["rope_cos_sin", "apply_rope", "attention_forward", "mlp_forward", "block_forward", "run_layers",
-           "nar_forward", "ar_hidden", "chunked_cross_entropy"]
+           "nar_forward", "ar_hidden", "chunked_cross_entropy", "chunked_losses"]

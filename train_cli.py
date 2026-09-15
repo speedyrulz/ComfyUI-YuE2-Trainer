@@ -215,6 +215,10 @@ def main(argv=None):
     pp.add_argument("--regularization", default=None, metavar="DIR",
                     help="Folder of base-model scores (YuE2 output directories / .abc sidecars) mixed into training.")
     pp.add_argument("--regularization-fraction", type=float, default=0.5)
+    pp.add_argument("--kl-weight", type=float, default=0.0,
+                    help="Trust region: weight of KL(base || LoRA) on the trained positions (0 = off).")
+    pp.add_argument("--abc-dropout", type=float, default=0.0,
+                    help="Share of semantic draws trained behind the no-sheet prompt (0 = always with the sheet).")
     pp.add_argument("--probe-every", type=int, default=0,
                     help="Generate a whole ABC score with the current LoRA every N steps (and before step 1); 0 = off.")
     pp.add_argument("--probe-style", default="", help="Probe style prompt (default: first training item's).")
@@ -335,6 +339,7 @@ def main(argv=None):
                                 lora_dtype=args.lora_dtype, gradient_checkpointing=not args.no_checkpointing,
                                 optimizer=args.optimizer, devices=args.devices, existing_lora=existing, resume_state=resume,
                                 regularization_fraction=args.regularization_fraction,
+                                kl_weight=args.kl_weight, abc_dropout=args.abc_dropout,
                                 probe_every=args.probe_every, probe_style=args.probe_style, probe_lyrics=probe_lyrics,
                                 probe_max_tokens=args.probe_max_tokens, probe_seed=args.probe_seed, probe_callback=probe_writer,
                                 probe_music_seconds=args.probe_music_seconds, probe_abc=probe_abc,

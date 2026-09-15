@@ -130,12 +130,18 @@ def split_counts(total: int, parts: int) -> list[int]:
     return [base + (1 if i < rem else 0) for i in range(parts)]
 
 
-def run_on_replicas(replicas: list[Replica], work: Callable[[Replica, int], torch.Tensor], counts: list[int]) -> float:
-    """Run ``work(replica, n_micro)`` on every replica concurrently (one thread per GPU); return summed loss."""
+def _finish(total: torch.Tensor):
+    total = total.float().cpu()
+    return float(total.item()) if total.ndim == 0 else total
+
+
+def run_on_replicas(replicas: list[Replica], work: Callable[[Replica, int], torch.Tensor], counts: list[int]):
+    """Run ``work(replica, n_micro)`` on every replica concurrently (one thread per GPU) and sum the results:
+    a float for scalar work results, a CPU tensor when ``work`` returns a vector of losses."""
     jobs = [(r, n) for r, n in zip(replicas, counts) if n > 0]
     if len(jobs) == 1:
         replica, n = jobs[0]
-        return float(work(replica, n).item())
+        return _finish(work(replica, n))
 
     errors = []
     results = [None] * len(jobs)
@@ -154,7 +160,7 @@ def run_on_replicas(replicas: list[Replica], work: Callable[[Replica, int], torc
             future.result()
     if errors:
         raise errors[0]
-    return float(sum(r.float().cpu() for r in results if r is not None).item())
+    return _finish(sum(r.float().cpu() for r in results if r is not None))
 
 
 def free_replicas(replicas: list[Replica]):

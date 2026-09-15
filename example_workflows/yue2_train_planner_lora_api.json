@@ -84,6 +84,8 @@
    "eval_holdout": 1,
    "resume_state": true,
    "regularization_fraction": 0.5,
+   "kl_weight": 0.0,
+   "abc_dropout": 0.0,
    "probe_every": 10,
    "probe_style": "",
    "probe_lyrics": "",

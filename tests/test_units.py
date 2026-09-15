@@ -165,6 +165,27 @@ def test_gradient_checkpointing_matches_plain():
     assert torch.allclose(g1, g2, atol=1e-6)
 
 
+def test_chunked_losses_kl_matches_direct():
+    import torch.nn.functional as F  # noqa: N812
+    from yue2_trainer.forward import chunked_losses
+    torch.manual_seed(0)
+    head = nn.Linear(8, 40, bias=False)
+    hidden = torch.randn(7, 8, requires_grad=True)
+    base = torch.randn(7, 8)
+    targets = torch.randint(0, 40, (7,))
+    ce, kl = chunked_losses(head, hidden, targets, base, chunk=3)
+    logits, base_logits = head(hidden), head(base)
+    want_ce = F.cross_entropy(logits, targets)
+    want_kl = (base_logits.softmax(-1) * (base_logits.log_softmax(-1) - logits.log_softmax(-1))).sum(-1).mean()
+    assert torch.allclose(ce, want_ce, atol=1e-5) and torch.allclose(kl, want_kl, atol=1e-5) and kl > 0
+    (ce + kl).backward()
+    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+    same_ce, same_kl = chunked_losses(head, hidden.detach(), targets, hidden.detach(), chunk=3)
+    assert torch.allclose(same_ce, want_ce, atol=1e-5) and abs(float(same_kl)) < 1e-6
+    only_ce, none_kl = chunked_losses(head, hidden.detach(), targets, None, chunk=3)
+    assert none_kl is None and torch.allclose(only_ce, want_ce, atol=1e-5)
+
+
 def test_chunked_cross_entropy():
     torch.manual_seed(0)
     head = nn.Linear(16, 40, bias=False)
@@ -342,7 +363,7 @@ def test_monitor_resume_eta_and_probe_lines(caplog):
     m = TrainMonitor("planner", total_steps=100, log_every=1, start_step=50)
     m.evals = [(0, 2.0), (50, 1.5)]
     with caplog.at_level(logging.INFO, logger="yue2_trainer"):
-        m.step(51, 1.0, 1e-4, 0.5)
+        m.step(51, 1.0, 1e-4, 0.5, extra={"loss/kl": 0.012})
         m.eval(60, 1.4, drift=0.9)
         m.probe(60, 3100, True, 12.0, path="x/step_000060.abc")
         m.probe(80, 8192, False, 30.0, music={"tokens": 1500, "seconds": 60.0, "ended": False, "distinct": 0.61,
@@ -351,7 +372,7 @@ def test_monitor_resume_eta_and_probe_lines(caplog):
                                              "budget_seconds": 60.0, "generation_seconds": 40.0})
         m.close()
     text = caplog.text
-    assert "step 51/100" in text and "eta" in text
+    assert "step 51/100" in text and "eta" in text and "kl 0.0120" in text
     assert "best 1.4000" in text and "regularizer loss 0.9000" in text
     assert "3100 ABC tokens" in text and "HIT THE TOKEN BUDGET" in text
     assert "1500 music tokens (60.0 s, 61% distinct) in 1:05, ran the whole 60-s budget" in text
@@ -378,6 +399,29 @@ def test_planner_semantic_sequence_ends_only_when_the_stream_ended():
     assert seqs[0].ids[seqs[0].loss_start - 1] == MUSIC_START
     assert seqs[0].ids[seqs[0].loss_start:] == [5 + CODEC_OFFSET, 6 + CODEC_OFFSET, 7 + CODEC_OFFSET, MUSIC_END]
     assert seqs[1].ids[seqs[1].loss_start:] == [8 + CODEC_OFFSET, 9 + CODEC_OFFSET]
+    assert seqs[0].alt_ids is None   # no score, so the sequence already uses the no-sheet prompt
+
+
+def test_planner_abc_dropout_uses_the_no_sheet_prompt():
+    import random
+    from types import SimpleNamespace
+    from yue2_trainer.constants import ABC_START, ABC_END, MUSIC_START
+    from yue2_trainer.dataset import Dataset, Item
+    from yue2_trainer.planner import PlannerConfig, _variant, build_sequences
+
+    class _Tok:
+        def encode(self, text):
+            return SimpleNamespace(ids=[1000 + (ord(c) % 50) for c in text])
+
+    clip = SimpleNamespace(tokenizer=SimpleNamespace(tokenizer=_Tok()))
+    item = Item(id="song", audio_path=None, style="rock", lyrics="la", abc='X:1\nK:C\n"C"C D E F|', semantic=[5, 6])
+    seq = build_sequences(clip, Dataset(items=[item]), PlannerConfig(train_abc=False, train_semantic=True))[0]
+    assert seq.alt_ids is not None and len(seq.alt_ids) < len(seq.ids)
+    assert seq.ids[seq.loss_start:] == seq.alt_ids[seq.alt_loss_start:]
+    assert seq.alt_ids[seq.alt_loss_start - 3:seq.alt_loss_start] == [ABC_START, ABC_END, MUSIC_START]
+    assert seq.ids[seq.loss_start - 2:seq.loss_start] == [ABC_END, MUSIC_START] and ABC_START in seq.ids[:seq.loss_start - 3]
+    assert _variant(seq, random.Random(0), 1.0) == (seq.alt_ids, seq.alt_loss_start)
+    assert _variant(seq, random.Random(0), 0.0) == (seq.ids, seq.loss_start)
 
 
 def test_semantic_windows_cover_every_frame_once():

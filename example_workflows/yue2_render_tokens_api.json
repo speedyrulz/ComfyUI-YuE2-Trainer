@@ -1,0 +1,123 @@
+{
+ "1": {
+  "class_type": "CheckpointLoaderSimple",
+  "inputs": {
+   "ckpt_name": "yue2_3b_bf16.safetensors"
+  }
+ },
+ "17": {
+  "class_type": "YuE2TrainerLoadLoRA",
+  "inputs": {
+   "lora_name": "yue2_semantic_planner_000030.safetensors",
+   "strength_model": 1.0,
+   "strength_clip": 1.0,
+   "clip": [
+    "1",
+    1
+   ]
+  }
+ },
+ "20": {
+  "class_type": "YuE2TrainerTokensConditioning",
+  "inputs": {
+   "clip": [
+    "17",
+    1
+   ],
+   "tokens": "yue2_probes/yue2_semantic_planner/step_000030.semantic.npy",
+   "style": "",
+   "lyrics": "",
+   "abc": "",
+   "mode": "auto",
+   "max_seconds": 0.0
+  }
+ },
+ "21": {
+  "class_type": "PreviewAny",
+  "inputs": {
+   "source": [
+    "20",
+    2
+   ]
+  }
+ },
+ "10": {
+  "class_type": "ModelSamplingAuraFlow",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "shift": 3.0
+  }
+ },
+ "12": {
+  "class_type": "ConditioningZeroOut",
+  "inputs": {
+   "conditioning": [
+    "20",
+    0
+   ]
+  }
+ },
+ "13": {
+  "class_type": "EmptyYuE2LatentAudio",
+  "inputs": {
+   "seconds": [
+    "20",
+    1
+   ],
+   "batch_size": 1
+  }
+ },
+ "14": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "10",
+    0
+   ],
+   "positive": [
+    "20",
+    0
+   ],
+   "negative": [
+    "12",
+    0
+   ],
+   "latent_image": [
+    "13",
+    0
+   ],
+   "seed": 831001,
+   "steps": 32,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "denoise": 1.0
+  }
+ },
+ "15": {
+  "class_type": "VAEDecodeAudio",
+  "inputs": {
+   "samples": [
+    "14",
+    0
+   ],
+   "vae": [
+    "1",
+    2
+   ]
+  }
+ },
+ "16": {
+  "class_type": "SaveAudio",
+  "inputs": {
+   "audio": [
+    "15",
+    0
+   ],
+   "filename_prefix": "yue2/probe_render"
+  }
+ }
+}

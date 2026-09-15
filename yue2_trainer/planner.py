@@ -13,7 +13,7 @@ import torch
 from .acoustic import TrainResult, _check_trainable_weights, _keep, _make_optimizer, _lr_at, split_holdout
 from .constants import CLIP_KEY_PREFIX, CODEC_OFFSET, CODEC_SIZE, CONTEXT, FRAMES_PER_SECOND, MUSIC_END
 from .dataset import CHORD_RE, Dataset, Item
-from .forward import ar_hidden, chunked_cross_entropy
+from .forward import ar_hidden, chunked_cross_entropy, chunked_losses
 from .lora import create_lora, select_target_modules, count_parameters
 from .monitor import TrainMonitor
 from .parallel import (Replica, clone_patcher_for_device, free_replicas, reduce_gradients, resolve_devices,
@@ -53,6 +53,8 @@ class PlannerConfig:
     eval_holdout: int = 1               # songs kept out of training and used for the evaluation set (0 = score training crops)
     keep: str = "final"                # final | best_eval: which weights the trainer returns
     regularization_fraction: float = 0.5   # share of micro-steps drawn from the regularization scores (when given)
+    kl_weight: float = 0.0              # trust region: weight of KL(base || LoRA) on the trained positions (0 = off)
+    abc_dropout: float = 0.0            # share of semantic draws trained with the no-sheet (cot off) prompt
     probe_every: int = 0                # generate a score with the current LoRA every N steps (0 = off)
     probe_style: str = ""               # blank = style prompt of the first training item
     probe_lyrics: str = ""              # blank = lyrics of the first training item
@@ -76,6 +78,8 @@ class _Sequence:
     kind: str
     ids: list
     loss_start: int
+    alt_ids: Optional[list] = None      # semantic: the same tokens behind the no-sheet (cot off) prompt
+    alt_loss_start: int = 0
 
 
 def build_sequences(clip, dataset: Dataset, cfg: PlannerConfig) -> list[_Sequence]:
@@ -89,8 +93,12 @@ def build_sequences(clip, dataset: Dataset, cfg: PlannerConfig) -> list[_Sequenc
             cot = resolve_mode("auto", item.abc, item.has_chords())
             prefix, _ = music_prefix_ids(clip, item.style, item.lyrics, item.abc if cot != "off" else None, cot)
             ended = bool(item.extra.get("semantic_ended", True))   # a stream cut off at a budget must not teach a false ending
-            ids = prefix + [int(t) + CODEC_OFFSET for t in item.semantic] + ([MUSIC_END] if ended else [])
-            sequences.append(_Sequence(item, "semantic", ids, len(prefix)))
+            span = [int(t) + CODEC_OFFSET for t in item.semantic] + ([MUSIC_END] if ended else [])
+            alt_ids, alt_start = None, 0
+            if cot != "off":   # the sheet-less variant for abc_dropout (what Comfy runs with an empty ABC input)
+                alt_prefix, _ = music_prefix_ids(clip, item.style, item.lyrics, None, "off")
+                alt_ids, alt_start = alt_prefix + span, len(alt_prefix)
+            sequences.append(_Sequence(item, "semantic", prefix + span, len(prefix), alt_ids, alt_start))
     if not sequences:
         raise ValueError("No planner training sequences: items need an ABC score (train_abc) "
                          "or semantic tokens (train_semantic)")
@@ -100,7 +108,19 @@ def build_sequences(clip, dataset: Dataset, cfg: PlannerConfig) -> list[_Sequenc
 CROP_CONTEXT = 256   # unsupervised context tokens at the start of a window that does not begin at the score's start
 
 
+def _variant(seq: _Sequence, rng: random.Random, abc_dropout: float) -> tuple[list, int]:
+    """(ids, loss_start) of a draw: a semantic sequence trains behind the no-sheet prompt with probability
+    ``abc_dropout`` so one LoRA also serves generation without a score."""
+    if seq.alt_ids is not None and abc_dropout > 0 and rng.random() < abc_dropout:
+        return seq.alt_ids, seq.alt_loss_start
+    return seq.ids, seq.loss_start
+
+
 def _crop(seq: _Sequence, max_tokens: int, rng: random.Random) -> tuple[list, int]:
+    return _crop_ids(seq.ids, seq.loss_start, max_tokens, rng)
+
+
+def _crop_ids(ids: list, loss_start: int, max_tokens: int, rng: random.Random) -> tuple[list, int]:
     """Keep the prefix; crop the trained span to ``max_tokens`` without teaching false starts or endless scores.
 
     A span longer than the limit is trained through one of three windows per draw: its head (so the
@@ -110,10 +130,10 @@ def _crop(seq: _Sequence, max_tokens: int, rng: random.Random) -> tuple[list, in
     uniformly random window almost never contained the closing token for long songs, and a planner LoRA
     trained that way stops ending its scores after a few dozen steps.
     """
-    span = len(seq.ids) - seq.loss_start
-    limit = min(max_tokens, CONTEXT - seq.loss_start)
+    span = len(ids) - loss_start
+    limit = min(max_tokens, CONTEXT - loss_start)
     if span <= limit:
-        return seq.ids, seq.loss_start
+        return ids, loss_start
     draw = rng.random()
     if draw < 1.0 / 3.0:
         start = 0
@@ -121,9 +141,9 @@ def _crop(seq: _Sequence, max_tokens: int, rng: random.Random) -> tuple[list, in
         start = span - limit
     else:
         start = rng.randint(0, span - limit)
-    ids = seq.ids[:seq.loss_start] + seq.ids[seq.loss_start + start: seq.loss_start + start + limit]
+    out = ids[:loss_start] + ids[loss_start + start: loss_start + start + limit]
     context = min(CROP_CONTEXT, limit // 4) if start > 0 else 0
-    return ids, seq.loss_start + context
+    return out, loss_start + context
 
 
 def pick_sequence(rng: random.Random, train: list, regularization: list, fraction: float):
@@ -216,6 +236,47 @@ def generate_music(clip, style: str, lyrics: str, abc: Optional[str], mode: str,
     if codes and not (0 <= min(codes) and max(codes) < CODEC_SIZE):
         raise RuntimeError("YuE2 music sampling returned tokens outside the codec vocabulary")
     return codes, not truncated
+
+
+def conditioning_from_tokens(clip, style: str, lyrics: str, abc: Optional[str], mode: str, codes: list) -> list:
+    """Acoustic-stage conditioning for an existing music-token stream (codebook indices 0..32767), exactly what
+    ``YuE2GenerateMusic`` would output had it sampled these tokens: the AR key/value cache over
+    prefix + tokens + MUSIC_END, chunked to the context. Returns a ComfyUI CONDITIONING list."""
+    import comfy.model_management
+    if not codes:
+        raise ValueError("No music tokens to condition on")
+    if min(codes) < 0 or max(codes) >= CODEC_SIZE:
+        raise ValueError(f"music tokens must be codebook indices 0..{CODEC_SIZE - 1}")
+    cot = mode if abc and abc.strip() and mode in ("full", "melody") else "off"
+    score = abc if cot != "off" else None
+    prefix, abc_ids = music_prefix_ids(clip, style, lyrics, score, cot)
+    tokens = clip.tokenize(style, lyrics=lyrics, cot=cot, abc=score or "", max_tokens=len(codes))
+    clip.load_model(tokens)
+    device = clip.patcher.load_device
+    te = clip.cond_stage_model
+    te.set_clip_options({"execution_device": device})
+    dtype = torch.bfloat16 if comfy.model_management.should_use_bf16(device) else torch.float32
+    device_context = getattr(comfy.model_management, "cuda_device_context", None)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(torch.no_grad())
+        if device_context is not None:
+            stack.enter_context(device_context(device))
+        cond, chunks = te._acoustic_conditioning(prefix, [int(c) + CODEC_OFFSET for c in codes], dtype)
+    return [[cond, {"pooled_output": None, "yue2_chunks": chunks, "yue2_abc_ids": abc_ids,
+                    "yue2_frames": len(codes), "yue2_truncated": False}]]
+
+
+@contextlib.contextmanager
+def _lora_off(lora):
+    """Run the base model: ComfyUI's bypass hooks scale every adapter by its ``multiplier`` at call time."""
+    stash = [(adapter, getattr(adapter, "multiplier", 1.0)) for adapter in lora.adapters]
+    try:
+        for adapter, _ in stash:
+            adapter.multiplier = 0.0
+        yield
+    finally:
+        for adapter, value in stash:
+            adapter.multiplier = value
 
 
 @contextlib.contextmanager
@@ -332,6 +393,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
     eval_set = build_eval_set(eval_pool, cfg, cfg.seed)
     drift_set = build_eval_set(reg_sequences, cfg, cfg.seed + 777) if reg_sequences else []
     losses: list[float] = []
+    kls: list[float] = []
     evals: list[list] = []
     drift: list[list] = []
     probes: list[dict] = []
@@ -341,6 +403,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
         start_step = int(restored["step"])
         losses, evals = list(restored["losses"]), [list(e) for e in restored["evals"]]
         drift, probes = [list(e) for e in restored.get("drift", [])], list(restored.get("probes", []))
+        kls = list(restored.get("kl", []))
         if start_step >= cfg.steps:
             raise ValueError(f"The resumed run is already at step {start_step}; set steps above it to continue "
                              "(or turn resume_state off to start a new run from the LoRA weights)")
@@ -350,6 +413,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             "eval_holdout": sorted(held), "drift": drift, "probe": probes,
             "regularization_sequences": len(reg_sequences),
             "regularization_fraction": cfg.regularization_fraction if reg_sequences else 0.0,
+            "kl_weight": cfg.kl_weight, "kl": kls, "abc_dropout": cfg.abc_dropout,
             "probe_every": cfg.probe_every, "probe_music_seconds": cfg.probe_music_seconds, "resumed_from": start_step,
             "sequences": len(sequences), "train_abc": cfg.train_abc, "train_semantic": cfg.train_semantic,
             "max_tokens": cfg.max_tokens, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule,
@@ -367,19 +431,26 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
     def work_fn(replica: Replica, n_micro: int) -> torch.Tensor:
         device, llm = replica.device, replica.root.model
         py_rng = replica.extra["py_rng"]
-        total = torch.zeros((), device=device, dtype=torch.float32)
+        total = torch.zeros((2,), device=device, dtype=torch.float32)   # [cross-entropy, KL to base]
         for _ in range(n_micro):
             seq = pick_sequence(py_rng, sequences, reg_sequences, cfg.regularization_fraction)
-            ids, loss_start = _crop(seq, cfg.max_tokens, py_rng)
+            ids, loss_start = _crop_ids(*_variant(seq, py_rng, cfg.abc_dropout), cfg.max_tokens, py_rng)
             tokens = torch.tensor([ids], dtype=torch.long, device=device)
+            base_hidden = None
+            if cfg.kl_weight > 0:
+                with torch.no_grad(), _lora_off(replica.lora), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    base_hidden = ar_hidden(llm, tokens, torch.bfloat16, checkpointing=False)[0, loss_start - 1: -1]
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 hidden = ar_hidden(llm, tokens, torch.bfloat16, checkpointing=cfg.gradient_checkpointing)
                 hidden = hidden[0, loss_start - 1: -1]
                 targets_t = tokens[0, loss_start:]
-                loss = chunked_cross_entropy(llm.lm_head, hidden, targets_t)
+                ce, kl = chunked_losses(llm.lm_head, hidden, targets_t, base_hidden)
+            loss = ce if kl is None else ce + cfg.kl_weight * kl
             (loss / micro_steps).backward()
-            total += loss.detach()
-            del hidden, loss, tokens
+            total[0] += ce.detach()
+            if kl is not None:
+                total[1] += kl.detach()
+            del hidden, base_hidden, loss, ce, kl, tokens
         return total
 
     best: dict = {}
@@ -415,7 +486,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
                      "distinct": round(len(set(codes)) / max(1, len(codes)), 3), "abc_source": source, "mode": mode,
                      "budget_seconds": cfg.probe_music_seconds,
                      "generation_seconds": round(time.perf_counter() - started, 1)}
-            meta["music"] = music
+            meta["music"] = {**music, "abc": abc or ""}
             entry["music"] = music
         path = cfg.probe_callback(index, text, meta, codes) if cfg.probe_callback else None
         if path:
@@ -425,7 +496,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
 
     def state_at(step: int) -> dict:
         return capture_state("planner", cfg, step, optimizer, replicas, losses, evals,
-                             extra={"drift": drift, "probes": probes})
+                             extra={"drift": drift, "probes": probes, "kl": kls})
 
     def due(step: int, every: int) -> bool:
         return every > 0 and (step % every == 0 or step == cfg.steps)
@@ -442,14 +513,18 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             for group in optimizer.param_groups:
                 group["lr"] = _lr_at(step, cfg.steps, cfg.warmup_steps, cfg.learning_rate, cfg.lr_schedule)
             optimizer.zero_grad(set_to_none=True)
-            loss_sum = run_on_replicas(replicas, work_fn, counts)
+            sums = run_on_replicas(replicas, work_fn, counts)
             reduce_gradients(replicas)
             grad_norm = float(torch.nn.utils.clip_grad_norm_(primary.lora.trainable, cfg.max_grad_norm or float("inf")))
             optimizer.step()
             sync_lora_weights(replicas)
-            step_loss = loss_sum / micro_steps
+            step_loss = float(sums[0]) / micro_steps
             losses.append(step_loss)
-            monitor.step(step + 1, step_loss, optimizer.param_groups[0]["lr"], grad_norm)
+            extra = None
+            if cfg.kl_weight > 0:
+                kls.append(float(sums[1]) / micro_steps)
+                extra = {"loss/kl": kls[-1]}
+            monitor.step(step + 1, step_loss, optimizer.param_groups[0]["lr"], grad_norm, extra)
             if eval_set and due(step + 1, cfg.eval_every):
                 run_eval(step + 1)
             if due(step + 1, cfg.probe_every):
@@ -485,4 +560,5 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
 
 
 __all__ = ["PlannerConfig", "train_planner_lora", "build_sequences", "build_eval_set", "CROP_CONTEXT",
-           "pick_sequence", "generate_abc", "generate_music", "PROBE_SAMPLING", "MUSIC_SAMPLING"]
+           "pick_sequence", "generate_abc", "generate_music", "conditioning_from_tokens", "PROBE_SAMPLING",
+           "MUSIC_SAMPLING"]
