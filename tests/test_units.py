@@ -374,3 +374,15 @@ def test_semantic_head_predict_shapes():
     assert np.array_equal(ids, predict(head, feats))
     norm = normalize(feats)
     assert np.allclose(norm.mean(0), 0, atol=1e-5) and np.allclose(norm.std(0), 1, atol=1e-2)
+
+
+def test_semantic_chunk_plan_pads_trailing_partial_second():
+    from yue2_trainer.semantic import chunk_plan, MERT_CHUNK, MERT_RATE
+    plan = chunk_plan(MERT_CHUNK + 9600)                    # 30.4 s: the 0.4 s tail is kept, padded to 1 s
+    assert plan == [(0, MERT_CHUNK, MERT_CHUNK), (MERT_CHUNK, MERT_CHUNK + 9600, MERT_RATE)]
+    assert chunk_plan(MERT_CHUNK) == [(0, MERT_CHUNK, MERT_CHUNK)]
+    assert chunk_plan(12000) == [(0, 12000, MERT_RATE)]      # half a second of audio still tokenizes
+    assert chunk_plan(2 * MERT_CHUNK + MERT_RATE)[-1] == (2 * MERT_CHUNK, 2 * MERT_CHUNK + MERT_RATE, MERT_RATE)
+    import pytest
+    with pytest.raises(ValueError):
+        chunk_plan(0)

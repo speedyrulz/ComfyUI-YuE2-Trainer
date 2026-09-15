@@ -56,6 +56,7 @@ class AcousticConfig:
     eval_every: int = 50                # fixed-noise validation loss every N steps (0 = off)
     eval_samples: int = 8               # size of the fixed evaluation set
     eval_holdout: int = 1               # songs kept out of training and used for the evaluation set (0 = score training crops)
+    keep: str = "final"                # final | best_eval: which weights the trainer returns
     tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
     run_name: str = ""                  # TensorBoard run name (timestamp appended)
     existing_lora: Optional[dict] = None
@@ -433,10 +434,14 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             del pred, loss, prefix_kv, x_t, x0, noise
         return total
 
+    best: dict = {}
+
     def run_eval(index: int):
         value = _evaluate(primary, eval_pool, eval_set, cfg)
         evals.append([index, value])
         monitor.eval(index, value)
+        if cfg.keep == "best_eval" and index > 0 and (not best or value < best["eval"]):
+            best.update(step=index, eval=value, lora_sd=primary.lora.export(), state=state_at(index))
 
     def state_at(step: int) -> dict:
         return capture_state("acoustic", cfg, step, optimizer, replicas, losses, evals)
@@ -486,8 +491,26 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     info["tensorboard"] = str(monitor.log_dir) if monitor.log_dir else None
     if evals:
         info["eval_loss_start"], info["eval_loss_final"] = evals[0][1], evals[-1][1]
+    exported, final_state = _keep(cfg, best, exported, final_state, info, "acoustic")
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,
                        seconds=time.perf_counter() - start_time, info=info, evals=evals, state=final_state)
+
+
+def _keep(cfg, best: dict, exported: dict, final_state, info: dict, kind: str):
+    """Apply ``cfg.keep``: return the weights (and resume state) of the best evaluation instead of the last step."""
+    info["kept_step"] = cfg.steps
+    if cfg.keep != "best_eval":
+        return exported, final_state
+    if not best:
+        logging.warning("YuE2 trainer: keep=best_eval but no evaluation ran after step 0 (eval_every off?); keeping the final step")
+        return exported, final_state
+    info["kept_step"], info["kept_eval"] = best["step"], best["eval"]
+    if best["step"] == cfg.steps:
+        logging.info("YuE2 %s: the final step had the best evaluation loss (%.4f)", kind, best["eval"])
+        return exported, final_state
+    logging.info("YuE2 %s: keeping the weights from step %d (evaluation loss %.4f) instead of the final step %d",
+                 kind, best["step"], best["eval"], cfg.steps)
+    return best["lora_sd"], best["state"]
 
 
 __all__ = ["AcousticConfig", "TrainResult", "train_acoustic_lora", "prepare_samples", "build_eval_set", "split_holdout"]

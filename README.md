@@ -196,6 +196,11 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   number only moves when the LoRA does and it measures how the LoRA handles a song it has not seen. With
   `eval_holdout` 0 every song trains and the set is drawn from the training songs instead, which measures
   fit only. Never more than `items - 3` songs are held out. See *Watching a run*.
+- `keep` (final): which weights the node outputs. `best_eval` returns the checkpoint with the lowest
+  evaluation loss of the run (its resume state follows), so the run can be scheduled long and still hand
+  back the checkpoint at the minimum. The final step stays the default because, for the planner, the
+  checkpoint that sounds closest to the album is often a little past the held-out minimum; `save_every`
+  checkpoints let you compare both.
 
 **Planner LoRA**
 

@@ -131,57 +131,98 @@ def _device_context(device: torch.device):
     return torch.cuda.device(device) if device.type == "cuda" else contextlib.nullcontext()
 
 
+def chunk_plan(samples: int, chunk: int = MERT_CHUNK, minimum: int = MERT_RATE) -> list[tuple[int, int, int]]:
+    """(start, end, padded_length) per MERT chunk. A trailing piece shorter than one second is padded with silence
+    to one second and its features trimmed back proportionally, instead of being dropped (dropping it would stretch
+    the earlier features over the full duration and shift every later frame)."""
+    if samples <= 0:
+        raise ValueError("audio must not be empty")
+    plan = []
+    for start in range(0, samples, chunk):
+        end = min(start + chunk, samples)
+        plan.append((start, end, max(end - start, minimum)))
+    return plan
+
+
 @torch.no_grad()
 def mert_features(model, processor, mono24k: np.ndarray, interrupt: Optional[Callable[[], None]] = None) -> np.ndarray:
     """MERT-v2-FullSong layer-20 features at 25 Hz, float16 [T, 1024]; 30-second chunks like the head's training data."""
     device = next(model.parameters()).device
-    chunks = [mono24k[start:start + MERT_CHUNK] for start in range(0, len(mono24k), MERT_CHUNK)]
-    chunks = [chunk for chunk in chunks if len(chunk) >= MERT_RATE]
-    if not chunks:
-        raise ValueError("audio must be at least one second long")
+    plan = chunk_plan(len(mono24k))
     features = []
     fallbacks = 0
-    for chunk in chunks:
+    for start, end, padded in plan:
         if interrupt is not None:
             interrupt()
+        chunk = mono24k[start:end]
+        if padded > end - start:
+            chunk = np.pad(chunk, (0, padded - (end - start)))
         inputs = {k: v.to(device) for k, v in processor([chunk], sampling_rate=MERT_RATE, return_tensors="pt").items()}
         with _device_context(device), torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             value = model(**inputs, output_hidden_states=True).hidden_states[MERT_LAYER][0].float()
         if not torch.isfinite(value).all():
-            # bf16 attention on a GPU that is not the process's current CUDA device can return NaN (seen with
-            # torch 2.13 on a second GPU); fp32 never does. Recompute this chunk in fp32.
+            # Guard: recompute the chunk in fp32 before giving up (NaN here used to come from the
+            # uninitialised rotary buffer, which load_mert now rules out).
             fallbacks += 1
             with _device_context(device):
                 value = model(**inputs, output_hidden_states=True).hidden_states[MERT_LAYER][0].float()
             if not torch.isfinite(value).all():
                 raise RuntimeError("MERT features are not finite even in fp32")
+        if padded > end - start:
+            value = value[: max(1, round(value.shape[0] * (end - start) / padded))]
         features.append(value.cpu())
     if fallbacks:
-        logging.warning("YuE2 trainer: %d/%d MERT chunks produced NaN in bf16 and were recomputed in fp32", fallbacks, len(chunks))
+        logging.warning("YuE2 trainer: %d/%d MERT chunks produced NaN in bf16 and were recomputed in fp32", fallbacks, len(plan))
     joined = torch.cat(features)
     frames = round(len(mono24k) / MERT_RATE * FRAMES_PER_SECOND)
     return F.interpolate(joined.T[None], size=frames, mode="linear", align_corners=False)[0].T.half().numpy()
+
+
+def _resolve_mert_dir(mert_path) -> str:
+    """A local MERT folder, or the Hugging Face id downloaded into the HF cache."""
+    local = Path(str(mert_path)).expanduser()
+    if local.is_dir():
+        return str(local)
+    from huggingface_hub import snapshot_download
+    return snapshot_download(str(mert_path))
+
+
+def load_mert(source, device):
+    """Build MERT-v2 from its config and load the weights into it.
+
+    ``AutoModel.from_pretrained`` (transformers 5) materialises the model from the meta device and never
+    computes the rotary module's non-persistent ``inv_freq`` buffer, leaving uninitialised memory: features
+    then come out either subtly wrong (rotary positions effectively disabled) or NaN, differently on every
+    load. Constructing the model normally and loading the state dict gives the buffer its real values.
+    """
+    import glob
+    import safetensors.torch
+    from transformers import AutoConfig, AutoModel
+    config = AutoConfig.from_pretrained(source, trust_remote_code=True, local_files_only=True)
+    model = AutoModel.from_config(config, trust_remote_code=True)
+    state = {}
+    for file in sorted(glob.glob(str(Path(source) / "*.safetensors"))):
+        state.update(safetensors.torch.load_file(file))
+    if not state:
+        raise FileNotFoundError(f"no .safetensors weights in {source}")
+    model.load_state_dict(state, strict=True)
+    for name, buffer in model.named_buffers():
+        if name.endswith("inv_freq"):
+            if not torch.isfinite(buffer).all() or abs(float(buffer.flatten()[0]) - 1.0) > 1e-6:
+                raise RuntimeError(f"MERT rotary buffer {name} is not initialised correctly")
+    return model.to(device).eval().requires_grad_(False)
 
 
 class SemanticTokenizer:
     """MERT-v2-FullSong + the v4 head on one device. Use as a context manager or call ``close``."""
 
     def __init__(self, head_path, mert_path: str = DEFAULT_MERT, device="cuda"):
-        from transformers import AutoFeatureExtractor, AutoModel
+        from transformers import AutoFeatureExtractor
         self.device = torch.device(device)
-        if self.device.type == "cuda":
-            # Create the process's default CUDA context before using another GPU: with torch 2.13 the first
-            # bf16 matmuls on a second GPU return NaN when the current device was never initialised.
-            torch.empty(1, device=torch.device("cuda", torch.cuda.current_device()))
-            torch.empty(1, device=self.device)
         t0 = time.perf_counter()
-        source = str(mert_path)
-        local = Path(source).expanduser()
-        kwargs = {"local_files_only": True} if local.is_dir() else {}
-        if local.is_dir():
-            source = str(local)
-        self.processor = AutoFeatureExtractor.from_pretrained(source, **kwargs)
-        self.mert = AutoModel.from_pretrained(source, trust_remote_code=True, **kwargs).to(self.device).eval().requires_grad_(False)
+        source = _resolve_mert_dir(mert_path)
+        self.processor = AutoFeatureExtractor.from_pretrained(source, local_files_only=True)
+        self.mert = load_mert(source, self.device)
         self.head = load_head(head_path, self.device)
         logging.info("YuE2 trainer: loaded MERT (%s) and tokenizer head (%s) on %s in %.1fs", source, Path(head_path).name,
                      self.device, time.perf_counter() - t0)
@@ -278,5 +319,5 @@ def summarize(summary: dict) -> str:
             + (": " + ", ".join(summary["failed"]) if summary["failed"] else ""))
 
 
-__all__ = ["TokenHead", "load_head", "normalize", "windows", "predict", "mert_features", "SemanticTokenizer",
+__all__ = ["TokenHead", "load_head", "load_mert", "normalize", "windows", "predict", "mert_features", "chunk_plan", "SemanticTokenizer",
            "tokenize_dataset", "summarize", "sidecar_path", "HEAD_FILENAME", "DEFAULT_MERT", "SOURCE_TAG"]

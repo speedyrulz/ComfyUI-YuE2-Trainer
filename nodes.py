@@ -458,6 +458,10 @@ def _common_training_inputs(default_lr, default_steps):
                              "falling or rises means the LoRA is over-training; the loss on training songs keeps "
                              "falling while it memorises them. 0 scores training crops instead (all songs train). "
                              "Never more than items - 3 are held out."),
+        io.Combo.Input("keep", options=["final", "best_eval"], default="final",
+                       tooltip="Which weights the node outputs: the final step, or the checkpoint with the lowest evaluation "
+                               "loss (best_eval; needs eval_every > 0). With eval_holdout 0 the evaluation measures fit, so "
+                               "best_eval is then simply the last step. The resume state follows the kept step."),
         io.Boolean.Input("tensorboard", default=False,
                          tooltip="Log loss, learning rate and grad norm to TensorBoard (pip install tensorboard)."),
         io.String.Input("tensorboard_dir", default="yue2_tensorboard", advanced=True,
@@ -512,7 +516,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
                 caption_dropout, timestep_sampling, shift, steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
                 existing_lora, resume_state, save_every, save_name, log_every, eval_every, eval_samples, eval_holdout,
-                tensorboard, tensorboard_dir):
+                keep, tensorboard, tensorboard_dir):
         cfg = AcousticConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             lr_schedule=lr_schedule,
@@ -523,7 +527,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             timestep_sampling=timestep_sampling, shift=shift, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
-            resume_state=_resume_state(existing_lora, resume_state),
+            resume_state=_resume_state(existing_lora, resume_state), keep=keep,
             log_every=log_every, eval_every=eval_every, eval_samples=eval_samples, eval_holdout=eval_holdout,
             tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
@@ -599,7 +603,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
                 rank, alpha,
                 targets, batch_size, grad_accumulation, warmup_steps, seed, optimizer, lora_dtype,
                 gradient_checkpointing, max_grad_norm, devices, existing_lora, resume_state, save_every, save_name, log_every,
-                eval_every, eval_samples, eval_holdout, tensorboard, tensorboard_dir, regularization=None):
+                eval_every, eval_samples, eval_holdout, keep, tensorboard, tensorboard_dir, regularization=None):
         cfg = PlannerConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
             lr_schedule=lr_schedule,
@@ -607,7 +611,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
             abc_mode=abc_mode, max_tokens=max_tokens, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
-            resume_state=_resume_state(existing_lora, resume_state),
+            resume_state=_resume_state(existing_lora, resume_state), keep=keep,
             regularization_fraction=regularization_fraction,
             probe_every=probe_every, probe_style=probe_style, probe_lyrics=probe_lyrics,
             probe_max_tokens=probe_max_tokens, probe_seed=probe_seed, probe_callback=_probe_writer(save_name),
@@ -650,6 +654,9 @@ def _report(result) -> str:
         best = min(evals, key=lambda e: e[1])
         lines.append(f"{label} eval loss: {evals[0][1]:.4f} before training -> {evals[-1][1]:.4f} at the end "
                      f"(best {best[1]:.4f} at step {best[0]})")
+    if result.info.get("kept_step") not in (None, result.steps):
+        lines.append(f"kept the weights from step {result.info['kept_step']} (best evaluation loss "
+                     f"{result.info.get('kept_eval', float('nan')):.4f}) instead of the final step")
     drift = result.info.get("drift") or []
     if len(drift) > 1:
         lines.append(f"regularizer loss (base-model scores): {drift[0][1]:.4f} -> {drift[-1][1]:.4f}")

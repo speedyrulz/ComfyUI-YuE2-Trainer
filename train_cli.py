@@ -179,6 +179,8 @@ def add_common(p):
     p.add_argument("--eval-samples", type=int, default=8, help="Size of the fixed evaluation set.")
     p.add_argument("--eval-holdout", type=int, default=1,
                    help="Songs kept out of training for the evaluation set (0 = score training crops).")
+    p.add_argument("--keep", default="final", choices=["final", "best_eval"],
+                   help="Save the final weights or the checkpoint with the lowest evaluation loss.")
     p.add_argument("--tensorboard", default=None, metavar="DIR",
                    help="Log loss/lr/grad-norm to TensorBoard under DIR (tensorboard --logdir DIR).")
     p.add_argument("--run-name", default="", help="TensorBoard run name (default: output name).")
@@ -302,7 +304,7 @@ def main(argv=None):
                                  gradient_checkpointing=not args.no_checkpointing, optimizer=args.optimizer,
                                  devices=args.devices, existing_lora=existing, resume_state=resume,
                                  log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
-                                 eval_holdout=args.eval_holdout,
+                                 eval_holdout=args.eval_holdout, keep=args.keep,
                                  tensorboard_dir=args.tensorboard or "",
                                  run_name=args.run_name or Path(args.out).stem, save_every=args.save_every, save_callback=save_partial)
             result = train_acoustic_lora(model, clip, dataset, cfg, progress=progress)
@@ -325,7 +327,7 @@ def main(argv=None):
                                 probe_every=args.probe_every, probe_style=args.probe_style, probe_lyrics=probe_lyrics,
                                 probe_max_tokens=args.probe_max_tokens, probe_seed=args.probe_seed, probe_callback=probe_writer,
                                 log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
-                                eval_holdout=args.eval_holdout,
+                                eval_holdout=args.eval_holdout, keep=args.keep,
                                 tensorboard_dir=args.tensorboard or "",
                                 run_name=args.run_name or Path(args.out).stem,
                                 save_every=args.save_every, save_callback=save_partial)

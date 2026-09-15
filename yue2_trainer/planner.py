@@ -10,7 +10,7 @@ from typing import Callable, Optional
 
 import torch
 
-from .acoustic import TrainResult, _check_trainable_weights, _make_optimizer, _lr_at, split_holdout
+from .acoustic import TrainResult, _check_trainable_weights, _keep, _make_optimizer, _lr_at, split_holdout
 from .constants import CLIP_KEY_PREFIX, CODEC_OFFSET, CONTEXT, MUSIC_END
 from .dataset import Dataset, Item
 from .forward import ar_hidden, chunked_cross_entropy
@@ -50,6 +50,7 @@ class PlannerConfig:
     eval_every: int = 50                # fixed-crop validation loss every N steps (0 = off)
     eval_samples: int = 8               # size of the fixed evaluation set
     eval_holdout: int = 1               # songs kept out of training and used for the evaluation set (0 = score training crops)
+    keep: str = "final"                # final | best_eval: which weights the trainer returns
     regularization_fraction: float = 0.5   # share of micro-steps drawn from the regularization scores (when given)
     probe_every: int = 0                # generate a score with the current LoRA every N steps (0 = off)
     probe_style: str = ""               # blank = style prompt of the first training item
@@ -321,6 +322,8 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             del hidden, loss, tokens
         return total
 
+    best: dict = {}
+
     def run_eval(index: int):
         value = _evaluate(primary, eval_set)
         evals.append([index, value])
@@ -328,6 +331,8 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
         if moved is not None:
             drift.append([index, moved])
         monitor.eval(index, value, moved)
+        if cfg.keep == "best_eval" and index > 0 and (not best or value < best["eval"]):
+            best.update(step=index, eval=value, lora_sd=primary.lora.export(), state=state_at(index))
 
     def run_probe(index: int):
         started = time.perf_counter()
@@ -400,6 +405,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
     info["tensorboard"] = str(monitor.log_dir) if monitor.log_dir else None
     if evals:
         info["eval_loss_start"], info["eval_loss_final"] = evals[0][1], evals[-1][1]
+    exported, final_state = _keep(cfg, best, exported, final_state, info, "planner")
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,
                        seconds=time.perf_counter() - start_time, info=info, evals=evals, state=final_state)
 

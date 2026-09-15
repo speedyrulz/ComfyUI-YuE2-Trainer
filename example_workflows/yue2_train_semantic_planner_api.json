@@ -92,7 +92,8 @@
    "regularization": [
     "11",
     0
-   ]
+   ],
+   "keep": "final"
   }
  },
  "5": {

@@ -80,7 +80,8 @@
    "eval_every": 50,
    "eval_samples": 8,
    "eval_holdout": 1,
-   "resume_state": true
+   "resume_state": true,
+   "keep": "final"
   }
  },
  "5": {
