@@ -11,17 +11,18 @@ from typing import Callable, Optional
 import torch
 
 from .acoustic import TrainResult, _check_trainable_weights, _keep, _make_optimizer, _lr_at, split_holdout
-from .constants import CLIP_KEY_PREFIX, CODEC_OFFSET, CONTEXT, MUSIC_END
-from .dataset import Dataset, Item
+from .constants import CLIP_KEY_PREFIX, CODEC_OFFSET, CODEC_SIZE, CONTEXT, FRAMES_PER_SECOND, MUSIC_END
+from .dataset import CHORD_RE, Dataset, Item
 from .forward import ar_hidden, chunked_cross_entropy
 from .lora import create_lora, select_target_modules, count_parameters
 from .monitor import TrainMonitor
 from .parallel import (Replica, clone_patcher_for_device, free_replicas, reduce_gradients, resolve_devices,
                        run_on_replicas, split_counts, sync_lora_weights)
-from .prefix import abc_sequence, music_prefix_ids, resolve_mode, load_clip_for_prefill
+from .prefix import abc_sequence, music_prefix_ids, negative_prefix_ids, resolve_mode, load_clip_for_prefill
 from .resume import capture_state, restore_state
 
 PROBE_SAMPLING = {"temperature": 0.7, "top_p": 0.9, "top_k": 30, "repetition_penalty": 1.005}   # YuE2GenerateABC defaults
+MUSIC_SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 100, "repetition_penalty": 1.2}    # YuE2GenerateMusic defaults
 
 
 @dataclass
@@ -58,7 +59,9 @@ class PlannerConfig:
     probe_mode: str = ""                # blank = abc_mode (full when abc_mode is auto)
     probe_max_tokens: int = 8192        # token budget of a probe; a probe that uses it all did not end its score
     probe_seed: int = 0
-    probe_callback: Optional[Callable[[int, str, dict], Optional[str]]] = None   # (step, abc, meta) -> saved path
+    probe_music_seconds: float = 0.0    # also write the music-token stream for the probe prompt, up to this many seconds (0 = off)
+    probe_abc: str = ""                 # fixed score for the music probes (blank = the score each probe writes)
+    probe_callback: Optional[Callable[..., Optional[str]]] = None   # (step, abc, meta, music_tokens | None) -> saved path
     tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
     run_name: str = ""                  # TensorBoard run name (timestamp appended)
     existing_lora: Optional[dict] = None
@@ -85,7 +88,8 @@ def build_sequences(clip, dataset: Dataset, cfg: PlannerConfig) -> list[_Sequenc
         if cfg.train_semantic and item.semantic:
             cot = resolve_mode("auto", item.abc, item.has_chords())
             prefix, _ = music_prefix_ids(clip, item.style, item.lyrics, item.abc if cot != "off" else None, cot)
-            ids = prefix + [int(t) + CODEC_OFFSET for t in item.semantic] + [MUSIC_END]
+            ended = bool(item.extra.get("semantic_ended", True))   # a stream cut off at a budget must not teach a false ending
+            ids = prefix + [int(t) + CODEC_OFFSET for t in item.semantic] + ([MUSIC_END] if ended else [])
             sequences.append(_Sequence(item, "semantic", ids, len(prefix)))
     if not sequences:
         raise ValueError("No planner training sequences: items need an ABC score (train_abc) "
@@ -168,6 +172,50 @@ def generate_abc(clip, style: str, lyrics: str, mode: str, seed: int, max_tokens
         ids = clip.generate(tokens, max_length=max_tokens, seed=seed, **sampling)
     ids = [int(t) for t in ids]
     return clip.decode(ids), len(ids), len(ids) < max_tokens
+
+
+def generate_music(clip, style: str, lyrics: str, abc: Optional[str], mode: str, seed: int, max_seconds: float,
+                   sampling: Optional[dict] = None, cfg_scale: Optional[float] = None) -> tuple[list[int], bool]:
+    """Write the music (semantic codec) token stream for a prompt through ComfyUI's own YuE2 sampler.
+
+    ``mode`` is the planning mode the score was written in (full / melody); without a score the model runs in
+    its ``off`` mode (music straight from style and lyrics), exactly as ``YuE2GenerateMusic`` does. Returns
+    (codebook indices 0..32767, ended): ``ended`` is False when the stream ran to the ``max_seconds`` budget
+    without the closing token. The LoRA hooks on ``clip`` apply; the sampling defaults are the music node's.
+    """
+    import comfy.model_management
+    import comfy.ops
+    sampling = {**MUSIC_SAMPLING, **(sampling or {})}
+    cot = mode if abc and abc.strip() and mode in ("full", "melody") else "off"
+    score = abc if cot != "off" else None
+    prefix, abc_ids = music_prefix_ids(clip, style, lyrics, score, cot)
+    negative = negative_prefix_ids(clip, abc_ids, cot)
+    max_tokens = min(max(1, round(max_seconds * FRAMES_PER_SECOND)), CONTEXT - max(len(prefix), len(negative)))
+    if max_tokens < 1:
+        raise ValueError("The prompt and score fill the model context; there is no room for music tokens")
+    tokens = clip.tokenize(style, lyrics=lyrics, cot=cot, abc=score or "", seed=seed, max_tokens=max_tokens, **sampling)
+    if cfg_scale is not None:
+        tokens["cfg_scale"] = cfg_scale
+    clip.load_model(tokens)
+    device = clip.patcher.load_device
+    te = clip.cond_stage_model
+    te.set_clip_options({"execution_device": device})
+    dtype = torch.bfloat16 if comfy.model_management.should_use_bf16(device) else torch.float32
+    device_context = getattr(comfy.model_management, "cuda_device_context", None)
+    quantized = getattr(comfy.ops, "use_quantized_matmul", None)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(torch.no_grad())
+        if device_context is not None:
+            stack.enter_context(device_context(device))
+        if quantized is not None:
+            stack.enter_context(quantized(te, device))
+        ids, truncated = te._generate(prefix, seed, max_tokens, "semantic", dtype, negative=negative,
+                                      cfg_scale=tokens["cfg_scale"], legacy_off=cot == "off", penalty_window=50,
+                                      min_tokens=min(200, max_tokens), **sampling)
+    codes = [int(t) - CODEC_OFFSET for t in ids]
+    if codes and not (0 <= min(codes) and max(codes) < CODEC_SIZE):
+        raise RuntimeError("YuE2 music sampling returned tokens outside the codec vocabulary")
+    return codes, not truncated
 
 
 @contextlib.contextmanager
@@ -253,6 +301,18 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
     probe_style = cfg.probe_style.strip() or sequences[0].item.style
     probe_lyrics = cfg.probe_lyrics if cfg.probe_lyrics.strip() else sequences[0].item.lyrics
     probe_mode = cfg.probe_mode or (cfg.abc_mode if cfg.abc_mode in ("full", "melody") else "full")
+    probe_item = sequences[0].item
+    default_probe_prompt = not cfg.probe_style.strip() and not cfg.probe_lyrics.strip()
+
+    def probe_score(text: str, ended: bool) -> tuple[Optional[str], str]:
+        """The score a music probe is conditioned on, and where it came from."""
+        if cfg.probe_abc.strip():
+            return cfg.probe_abc, "probe_abc"
+        if text and ended:
+            return text, "probe"
+        if default_probe_prompt and probe_item.abc:
+            return probe_item.abc, "song"
+        return None, "none"
 
     comfy.model_management.unload_all_models()
     clips = _load_clips(clip, devices)
@@ -290,7 +350,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             "eval_holdout": sorted(held), "drift": drift, "probe": probes,
             "regularization_sequences": len(reg_sequences),
             "regularization_fraction": cfg.regularization_fraction if reg_sequences else 0.0,
-            "probe_every": cfg.probe_every, "resumed_from": start_step,
+            "probe_every": cfg.probe_every, "probe_music_seconds": cfg.probe_music_seconds, "resumed_from": start_step,
             "sequences": len(sequences), "train_abc": cfg.train_abc, "train_semantic": cfg.train_semantic,
             "max_tokens": cfg.max_tokens, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
@@ -342,12 +402,26 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
         seconds = time.perf_counter() - started
         meta = {"step": index, "tokens": count, "ended": ended, "seconds": seconds, "style": probe_style,
                 "lyrics": probe_lyrics, "mode": probe_mode, "seed": cfg.probe_seed, "max_tokens": cfg.probe_max_tokens}
-        path = cfg.probe_callback(index, text, meta) if cfg.probe_callback else None
         entry = {"step": index, "tokens": count, "ended": ended, "seconds": round(seconds, 1)}
+        codes = music = None
+        if cfg.probe_music_seconds > 0:
+            abc, source = probe_score(text, ended)
+            mode = resolve_mode("auto", abc, bool(abc and CHORD_RE.search(abc)))
+            started = time.perf_counter()
+            with _adapter_weights_as(primary.lora, torch.bfloat16):
+                codes, music_ended = generate_music(primary.extra["clip"], probe_style, probe_lyrics, abc, mode,
+                                                    cfg.probe_seed, cfg.probe_music_seconds)
+            music = {"tokens": len(codes), "seconds": round(len(codes) / FRAMES_PER_SECOND, 1), "ended": music_ended,
+                     "distinct": round(len(set(codes)) / max(1, len(codes)), 3), "abc_source": source, "mode": mode,
+                     "budget_seconds": cfg.probe_music_seconds,
+                     "generation_seconds": round(time.perf_counter() - started, 1)}
+            meta["music"] = music
+            entry["music"] = music
+        path = cfg.probe_callback(index, text, meta, codes) if cfg.probe_callback else None
         if path:
             entry["path"] = str(path)
         probes.append(entry)
-        monitor.probe(index, count, ended, seconds, path)
+        monitor.probe(index, count, ended, seconds, path, music=music)
 
     def state_at(step: int) -> dict:
         return capture_state("planner", cfg, step, optimizer, replicas, losses, evals,
@@ -411,4 +485,4 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
 
 
 __all__ = ["PlannerConfig", "train_planner_lora", "build_sequences", "build_eval_set", "CROP_CONTEXT",
-           "pick_sequence", "generate_abc", "PROBE_SAMPLING"]
+           "pick_sequence", "generate_abc", "generate_music", "PROBE_SAMPLING", "MUSIC_SAMPLING"]

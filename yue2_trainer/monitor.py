@@ -102,9 +102,18 @@ class TrainMonitor:
                      self.kind, index, self.total, drift, self.drift[0][1],
                      (drift / self.drift[0][1] - 1.0) * 100.0 if self.drift[0][1] else 0.0)
 
-    def probe(self, index: int, tokens: int, ended: bool, seconds: float, path: Optional[str] = None):
-        """A score generated with the current LoRA at step ``index``: its length and whether it finished."""
-        self.probes.append({"step": index, "tokens": tokens, "ended": ended, "seconds": seconds})
+    def probe(self, index: int, tokens: int, ended: bool, seconds: float, path: Optional[str] = None,
+              music: Optional[dict] = None):
+        """A score generated with the current LoRA at step ``index``: its length and whether it finished.
+
+        ``music`` describes the music-token stream written for the same prompt, when there is one:
+        ``tokens``, ``seconds`` of music, ``ended``, ``distinct`` (share of distinct tokens),
+        ``budget_seconds`` and ``generation_seconds``.
+        """
+        entry = {"step": index, "tokens": tokens, "ended": ended, "seconds": seconds}
+        if music:
+            entry["music"] = dict(music)
+        self.probes.append(entry)
         if self.writer is not None:
             self.writer.add_scalar("probe/abc_tokens", tokens, index)
             self.writer.add_scalar("probe/ended", 1.0 if ended else 0.0, index)
@@ -114,6 +123,18 @@ class TrainMonitor:
                  _fmt_seconds(seconds), verdict,
                  f"  (step {first['step']}: {first['tokens']} tokens)" if len(self.probes) > 1 else "",
                  f"  -> {path}" if path else "")
+        if music:
+            if self.writer is not None:
+                self.writer.add_scalar("probe/music_tokens", music["tokens"], index)
+                self.writer.add_scalar("probe/music_ended", 1.0 if music["ended"] else 0.0, index)
+                self.writer.add_scalar("probe/music_distinct", music.get("distinct", 0.0), index)
+            earlier = next((p for p in self.probes[:-1] if p.get("music")), None)
+            verdict = "ended on its own" if music["ended"] else f"ran the whole {music.get('budget_seconds', 0.0):.0f}-s budget"
+            LOG.info("YuE2 %s music probe step %d/%d  %d music tokens (%.1f s, %.0f%% distinct) in %s, %s%s",
+                     self.kind, index, self.total, music["tokens"], music.get("seconds", 0.0),
+                     music.get("distinct", 0.0) * 100.0, _fmt_seconds(music.get("generation_seconds", 0.0)), verdict,
+                     f"  (step {earlier['step']}: {earlier['music']['tokens']} tokens, "
+                     f"{earlier['music'].get('distinct', 0.0) * 100:.0f}% distinct)" if earlier else "")
 
     def close(self, info: Optional[dict] = None):
         if self.writer is not None:
@@ -134,8 +155,17 @@ class TrainMonitor:
             LOG.info("YuE2 %s regularizer loss: %.4f before training -> %.4f at the end", self.kind,
                      self.drift[0][1], self.drift[-1][1])
         if self.probes:
-            LOG.info("YuE2 %s probes: %s", self.kind, "; ".join(
-                f"step {p['step']}: {p['tokens']} tokens{'' if p['ended'] else ' (budget hit)'}" for p in self.probes))
+            LOG.info("YuE2 %s probes: %s", self.kind, "; ".join(probe_summary(p) for p in self.probes))
 
 
-__all__ = ["TrainMonitor"]
+def probe_summary(p: dict) -> str:
+    """One probe entry as ``step 25: 3103 tokens, music 1500 tokens (budget, 61% distinct)``."""
+    text = f"step {p['step']}: {p['tokens']} tokens{'' if p['ended'] else ' (budget hit)'}"
+    music = p.get("music")
+    if music:
+        text += (f", music {music['tokens']} tokens ({'ended' if music['ended'] else 'budget'}, "
+                 f"{music.get('distinct', 0.0) * 100:.0f}% distinct)")
+    return text
+
+
+__all__ = ["TrainMonitor", "probe_summary"]

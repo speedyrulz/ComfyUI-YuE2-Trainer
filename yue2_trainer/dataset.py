@@ -161,7 +161,8 @@ def _item_from_yue2_output(directory: Path) -> Optional[Item]:
         latents = torch.from_numpy(np.ascontiguousarray(arr)).to(torch.float16)
     item = Item(id=meta.get("id") or directory.name, audio_path=str(audio) if audio.is_file() else None,
                 style=meta.get("style", ""), lyrics=meta.get("lyrics", ""), abc=abc, semantic=semantic,
-                latents=latents, source="yue2_output")
+                latents=latents, source="yue2_output",
+                extra={k: meta[k] for k in ("semantic_ended", "music_seconds", "generated_by") if k in meta})
     if latents is not None:
         item.seconds = latents.shape[-1] / FRAMES_PER_SECOND
     return item

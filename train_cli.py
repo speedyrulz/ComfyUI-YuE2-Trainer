@@ -221,6 +221,11 @@ def main(argv=None):
     pp.add_argument("--probe-lyrics", default="", help="Probe lyrics, or @file to read them from a file.")
     pp.add_argument("--probe-max-tokens", type=int, default=8192)
     pp.add_argument("--probe-seed", type=int, default=0)
+    pp.add_argument("--probe-music-seconds", type=float, default=0.0,
+                    help="Also write the music-token stream for the probe prompt with the current LoRA, up to N seconds "
+                         "(saved as step_NNNNNN.semantic.npy next to the score); 0 = off.")
+    pp.add_argument("--probe-abc", default="",
+                    help="Fixed ABC score for the music probes, or @file (default: the score each probe writes).")
     pp.add_argument("--probe-dir", default=None, help="Where probe scores are written (default: <out>_probes/).")
     args = parser.parse_args(argv)
 
@@ -279,7 +284,7 @@ def main(argv=None):
             save_state(state, state_path(target))
         logging.info("saved intermediate LoRA %s%s", target, " (+ resume state)" if state else "")
 
-    def probe_writer(step, abc, meta):
+    def probe_writer(step, abc, meta, music=None):
         folder = Path(args.probe_dir) if getattr(args, "probe_dir", None) else Path(str(Path(args.out).with_suffix("")) + "_probes")
         if not folder.is_absolute() and folder.parent == Path("."):
             import folder_paths
@@ -288,6 +293,9 @@ def main(argv=None):
         target = folder / f"step_{step:06d}.abc"
         target.write_text(abc, encoding="utf-8")
         target.with_suffix(".json").write_text(json.dumps(meta, indent=1, ensure_ascii=False), encoding="utf-8")
+        if music is not None:
+            import numpy as np
+            np.save(folder / f"step_{step:06d}.semantic.npy", np.asarray(music, dtype=np.int32))
         return str(target)
 
     with torch.inference_mode(False):
@@ -314,6 +322,9 @@ def main(argv=None):
             probe_lyrics = args.probe_lyrics
             if probe_lyrics.startswith("@"):
                 probe_lyrics = Path(probe_lyrics[1:]).read_text(encoding="utf-8")
+            probe_abc = args.probe_abc
+            if probe_abc.startswith("@"):
+                probe_abc = Path(probe_abc[1:]).read_text(encoding="utf-8")
             regularization = scan_folder(args.regularization) if args.regularization else None
             if regularization is not None:
                 logging.info("regularization scores:\n%s", regularization.describe())
@@ -326,6 +337,7 @@ def main(argv=None):
                                 regularization_fraction=args.regularization_fraction,
                                 probe_every=args.probe_every, probe_style=args.probe_style, probe_lyrics=probe_lyrics,
                                 probe_max_tokens=args.probe_max_tokens, probe_seed=args.probe_seed, probe_callback=probe_writer,
+                                probe_music_seconds=args.probe_music_seconds, probe_abc=probe_abc,
                                 log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
                                 eval_holdout=args.eval_holdout, keep=args.keep,
                                 tensorboard_dir=args.tensorboard or "",

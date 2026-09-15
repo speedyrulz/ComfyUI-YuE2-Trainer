@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
 from typing_extensions import override
 
@@ -23,7 +24,8 @@ from .yue2_trainer.dataset import Dataset, Item, cache_key, clone_dataset, load_
 from .yue2_trainer.lora import TARGET_PRESETS, load_lora_file, save_lora_file
 from .yue2_trainer.parallel import device_choices
 from .yue2_trainer.sidecars import DEFAULT_CLAUDE, PRECISIONS, SidecarConfig, WHISPER_CHOICES, prepare_folder, summarize
-from .yue2_trainer.planner import PROBE_SAMPLING, PlannerConfig, generate_abc, train_planner_lora
+from .yue2_trainer.monitor import probe_summary
+from .yue2_trainer.planner import MUSIC_SAMPLING, PROBE_SAMPLING, PlannerConfig, generate_abc, generate_music, train_planner_lora
 from .yue2_trainer.resume import load_state, save_state, state_path
 from .yue2_trainer.semantic import DEFAULT_MERT, HEAD_FILENAME, SemanticTokenizer, tokenize_dataset
 from .yue2_trainer.semantic import summarize as summarize_semantic
@@ -66,14 +68,17 @@ def _probe_dir(save_name: str) -> Path:
 
 
 def _probe_writer(save_name: str):
-    """Saves every probe score as output/yue2_probes/<save_name>/step_000025.abc (+ .json with its metadata)."""
+    """Saves every probe score as output/yue2_probes/<save_name>/step_000025.abc (+ .json with its metadata,
+    + .semantic.npy with the music tokens when the probe wrote a music stream)."""
     folder = _probe_dir(save_name)
 
-    def write(step: int, abc: str, meta: dict):
+    def write(step: int, abc: str, meta: dict, music=None):
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / f"step_{step:06d}.abc"
         target.write_text(abc, encoding="utf-8")
         target.with_suffix(".json").write_text(json.dumps(meta, indent=1, ensure_ascii=False), encoding="utf-8")
+        if music is not None:
+            np.save(folder / f"step_{step:06d}.semantic.npy", np.asarray(music, dtype=np.int32))
         return str(target)
 
     return write
@@ -583,10 +588,21 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
                                 tooltip="Style prompt for the probes (blank = the first training song's style)."),
                 io.String.Input("probe_lyrics", default="", multiline=True,
                                 tooltip="Lyrics for the probes (blank = the first training song's lyrics)."),
+                io.Float.Input("probe_music_seconds", default=0.0, min=0.0, max=900.0, step=1.0,
+                               tooltip="With probe_every: after each probe score, also write the music-token stream for "
+                                       "the probe prompt with the current LoRA (conditioned on the score the probe just "
+                                       "wrote), up to this many seconds, and report its length, whether it ended and how "
+                                       "repetitive it is. The tokens land next to the score as step_NNNNNN.semantic.npy. "
+                                       "This is the over-training signal for train_semantic. 0 = off. About a minute "
+                                       "per 60 s."),
                 io.Int.Input("probe_max_tokens", default=8192, min=256, max=20000, advanced=True,
                              tooltip="Token budget of a probe score; a probe that uses all of it did not end."),
                 io.Int.Input("probe_seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF, advanced=True,
                              tooltip="Fixed sampling seed shared by all probes so they are comparable."),
+                io.String.Input("probe_abc", default="", multiline=True, advanced=True,
+                                tooltip="Fixed ABC score for the music probes, so every checkpoint is measured on the same "
+                                        "score (blank = the score each probe writes; if that one did not end, the first "
+                                        "training song's score)."),
                 *_common_training_inputs(5e-5, 100),
                 DATASET.Input("regularization", optional=True,
                               tooltip="Scores the BASE model wrote (YuE2 Regularization Scores node, or a folder of YuE2 "
@@ -599,7 +615,8 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, dataset, train_abc, train_semantic, abc_mode, max_tokens, regularization_fraction,
-                probe_every, probe_style, probe_lyrics, probe_max_tokens, probe_seed, steps, learning_rate, lr_schedule,
+                probe_every, probe_style, probe_lyrics, probe_music_seconds, probe_max_tokens, probe_seed, probe_abc,
+                steps, learning_rate, lr_schedule,
                 rank, alpha,
                 targets, batch_size, grad_accumulation, warmup_steps, seed, optimizer, lora_dtype,
                 gradient_checkpointing, max_grad_norm, devices, existing_lora, resume_state, save_every, save_name, log_every,
@@ -615,6 +632,7 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
             regularization_fraction=regularization_fraction,
             probe_every=probe_every, probe_style=probe_style, probe_lyrics=probe_lyrics,
             probe_max_tokens=probe_max_tokens, probe_seed=probe_seed, probe_callback=_probe_writer(save_name),
+            probe_music_seconds=probe_music_seconds, probe_abc=probe_abc,
             log_every=log_every, eval_every=eval_every, eval_samples=eval_samples, eval_holdout=eval_holdout,
             tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
@@ -662,8 +680,8 @@ def _report(result) -> str:
         lines.append(f"regularizer loss (base-model scores): {drift[0][1]:.4f} -> {drift[-1][1]:.4f}")
     probes = result.info.get("probe") or []
     if probes:
-        lines.append("probes: " + "; ".join(
-            f"step {p['step']}: {p['tokens']} tokens" + ("" if p["ended"] else " (BUDGET HIT, did not end)") for p in probes))
+        lines.append("probes: " + "; ".join(probe_summary(p).replace("(budget hit)", "(BUDGET HIT, did not end)")
+                                            for p in probes))
         if probes[-1].get("path"):
             lines.append(f"probe scores: {Path(probes[-1]['path']).parent}")
     if result.info.get("tensorboard"):
@@ -720,7 +738,9 @@ class YuE2TrainerRegularizationScores(io.ComfyNode):
             description="Writes ABC scores with the BASE model (no LoRA) for a few prompts and returns them as a dataset "
                         "for the planner trainer's regularization input. Like DreamBooth's class images: mixed into "
                         "training, they keep the planner writing well-formed, normal-length scores. Scores are saved "
-                        "under output/<folder> as YuE2 output directories and reused on the next run.",
+                        "under output/<folder> as YuE2 output directories and reused on the next run. With "
+                        "music_seconds the base model also writes its music tokens for every score, so the set "
+                        "covers train_semantic as well.",
             inputs=[
                 io.Clip.Input("clip", tooltip="CLIP from the YuE2 checkpoint WITHOUT any LoRA applied."),
                 io.String.Input("styles", default="", multiline=True,
@@ -733,6 +753,11 @@ class YuE2TrainerRegularizationScores(io.ComfyNode):
                              tooltip="Scores written per prompt (different seeds)."),
                 io.Combo.Input("mode", options=["full", "melody"], default="full",
                                tooltip="Planning mode; use the abc_mode you train the planner with."),
+                io.Float.Input("music_seconds", default=0.0, min=0.0, max=900.0, step=1.0,
+                               tooltip="Also have the base model write its music tokens for every score, up to this many "
+                                       "seconds, and keep them as semantic.npy: the regularization set then covers "
+                                       "train_semantic as well (prior preservation for the music-token target). 0 = "
+                                       "scores only. About a minute per 60 s per score; reused on later runs."),
                 io.Int.Input("seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF),
                 io.Int.Input("max_abc_tokens", default=8192, min=256, max=20000, advanced=True,
                              tooltip="Scores that do not end within this budget are discarded (they would teach endless scores)."),
@@ -752,8 +777,8 @@ class YuE2TrainerRegularizationScores(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, clip, styles, lyrics, scores_per_prompt, mode, seed, max_abc_tokens, temperature, top_p, top_k,
-                repetition_penalty, folder, dataset=None):
+    def execute(cls, clip, styles, lyrics, scores_per_prompt, mode, music_seconds, seed, max_abc_tokens, temperature,
+                top_p, top_k, repetition_penalty, folder, dataset=None):
         import hashlib
         prompts = [(line.strip(), lyrics) for line in styles.splitlines() if line.strip()]
         if not prompts:
@@ -764,7 +789,7 @@ class YuE2TrainerRegularizationScores(io.ComfyNode):
         if not root.is_absolute():
             root = Path(folder_paths.get_output_directory()) / root
         sampling = {"temperature": temperature, "top_p": top_p, "top_k": top_k, "repetition_penalty": repetition_penalty}
-        items, written, reused, dropped = [], 0, 0, 0
+        items, written, reused, dropped, music_written, music_reused = [], 0, 0, 0, 0, 0
         total = len(prompts) * scores_per_prompt
         pbar = comfy.utils.ProgressBar(total)
         for p_index, (style, lyric) in enumerate(prompts):
@@ -792,13 +817,36 @@ class YuE2TrainerRegularizationScores(io.ComfyNode):
                                                    "generated_by": "YuE2TrainerRegularizationScores"},
                                                   indent=1, ensure_ascii=False), encoding="utf-8")
                     written += 1
-                items.append(Item(id=folder_i.name, audio_path=None, style=style, lyrics=lyric,
-                                  abc=score.read_text(encoding="utf-8"), source="regularization"))
+                abc_text = score.read_text(encoding="utf-8")
+                semantic, extra = None, {}
+                if music_seconds > 0:
+                    music_file = folder_i / "semantic.npy"
+                    meta = json.loads(request.read_text(encoding="utf-8"))
+                    if music_file.is_file() and (meta.get("semantic_ended")
+                                                 or float(meta.get("music_seconds", 0)) >= music_seconds):
+                        music_reused += 1
+                    else:
+                        _interrupt()
+                        codes, music_ended = generate_music(clip, style, lyric, abc_text, mode, this_seed, music_seconds)
+                        np.save(music_file, np.asarray(codes, dtype=np.int32))
+                        meta.update(music_seconds=music_seconds, music_seed=this_seed, semantic_tokens=len(codes),
+                                    semantic_ended=music_ended, music_sampling=MUSIC_SAMPLING)
+                        request.write_text(json.dumps(meta, indent=1, ensure_ascii=False), encoding="utf-8")
+                        music_written += 1
+                        logging.info("YuE2 trainer: base-model music tokens for %s: %d tokens (%.1f s), %s", folder_i.name,
+                                     len(codes), len(codes) / FRAMES_PER_SECOND, "ended" if music_ended else "budget reached")
+                    meta = json.loads(request.read_text(encoding="utf-8"))
+                    semantic = [int(t) for t in np.load(music_file).reshape(-1).tolist()] or None
+                    extra = {"semantic_ended": bool(meta.get("semantic_ended", True))}
+                items.append(Item(id=folder_i.name, audio_path=None, style=style, lyrics=lyric, abc=abc_text,
+                                  semantic=semantic, source="regularization", extra=extra))
                 pbar.update_absolute(p_index * scores_per_prompt + copy + 1, total)
         if not items:
             raise ValueError("No regularization scores: every score ran past max_abc_tokens; raise it or lower temperature")
+        music = (f", music tokens for {sum(1 for item in items if item.semantic)} of them "
+                 f"({music_written} written, {music_reused} reused)" if music_seconds > 0 else "")
         report = (f"{len(items)} regularization scores from {len(prompts)} prompts ({written} written, {reused} reused, "
-                  f"{dropped} discarded for not ending) in {root}")
+                  f"{dropped} discarded for not ending){music} in {root}")
         logging.info("YuE2 trainer: %s", report)
         return io.NodeOutput(Dataset(items=items, meta={"folder": str(root), "kind": "regularization"}), report)
 

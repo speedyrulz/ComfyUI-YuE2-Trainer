@@ -87,8 +87,10 @@
    "probe_every": 10,
    "probe_style": "",
    "probe_lyrics": "",
+   "probe_music_seconds": 0.0,
    "probe_max_tokens": 8192,
    "probe_seed": 0,
+   "probe_abc": "",
    "regularization": [
     "11",
     0
@@ -150,6 +152,7 @@
    "lyrics": "",
    "scores_per_prompt": 1,
    "mode": "full",
+   "music_seconds": 0.0,
    "seed": 0,
    "max_abc_tokens": 8192,
    "temperature": 0.7,

@@ -125,7 +125,7 @@ C:/ai/ComfyUI/venv/Scripts/python.exe prepare_dataset.py D:/songs --sections cla
 | **YuE2 Encode Dataset** | VAE-encode every item to latents in fp32 (cached under `output/yue2_trainer_cache`), optionally transcribe missing ABC with a SheetSage2 `AUDIO_ENCODER`. |
 | **YuE2 Train Acoustic LoRA (MODEL)** | Flow-matching LoRA training of the acoustic model. Outputs `LORA_MODEL`, `LOSS_MAP`, steps, a text report. |
 | **YuE2 Train Planner LoRA (CLIP)** | Next-token LoRA training of the language model on ABC (and semantic tokens when present). Optional regularization input and checkpoint probes (see below). |
-| **YuE2 Regularization Scores** | Writes ABC scores with the base model for a few prompts and returns them as a dataset for the planner trainer's `regularization` input (saved under `output/yue2_regularization`, reused on later runs). |
+| **YuE2 Regularization Scores** | Writes ABC scores with the base model for a few prompts (and, with `music_seconds`, the base model's music tokens for each score) and returns them as a dataset for the planner trainer's `regularization` input (saved under `output/yue2_regularization`, reused on later runs). |
 | **YuE2 Save LoRA** | Writes the LoRA to `models/loras/<name>.safetensors` with training metadata; with `name` blank and `loss_map` connected it uses the trainer's `save_name`. The core `SaveLoRA` node also works (it writes to `output/`). |
 | **YuE2 Load LoRA** | Applies a LoRA to MODEL and/or CLIP; either input can be left unconnected. |
 
@@ -143,8 +143,8 @@ or use *Load*; recent frontends import API-format JSON):
   node (base scores for the dataset's own prompts) on the `regularization` input
 - `yue2_train_semantic_planner_api.json` – the planner graph with **YuE2 Semantic Tokens** between encoding and
   training and both targets on (`train_abc` + `train_semantic`, rank 32, 60 steps, a checkpoint and eval
-  every 5 steps, a probe every 10, regularization scores at 0.2); needs the community tokenizer head (see
-  *Semantic tokens for your own recordings*)
+  every 5 steps, an ABC + 60-s music probe every 10, regularization scores with 120 s of base-model music
+  tokens at 0.2); needs the community tokenizer head (see *Semantic tokens for your own recordings*)
 - `yue2_generate_with_lora_api.json` – the stock YuE2 generation graph with **YuE2 Load LoRA** between the
   checkpoint loader and the YuE2 nodes
 
@@ -232,7 +232,10 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   connected, every evaluation also reports the `regularizer loss` on fixed crops of those scores: it starts
   at the base model's own value and should stay close to it; a steady climb means the LoRA is drifting away
   from base-model writing faster than the regularization can hold it (lower the learning rate or raise the
-  fraction).
+  fraction). With `train_semantic` on, set the node's `music_seconds` (120 is plenty): the base model then
+  also writes its own music-token stream for every score, saved as `semantic.npy` next to it, and the
+  regularization covers the music-token target too. A stream cut off at the budget is trained without a
+  closing token, so it never teaches a false ending.
 - `probe_every` (0 = off; set it to `save_every`): every N steps, and before step 1, the trainer writes one
   whole ABC score with the current LoRA through YuE2's own sampler (same defaults as `YuE2GenerateABC`,
   fixed `probe_seed`) and reports its length and whether it produced the closing token. A probe that uses
@@ -242,6 +245,13 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   them into `YuE2GenerateMusic`'s `abc` input and listen to what each checkpoint writes. Each probe costs as
   much as one `YuE2GenerateABC` run (a minute or two for a 3,000-token score, more for one that hits the
   cap).
+- `probe_music_seconds` (0 = off): with probes on, each probe also writes the music-token stream for the
+  probe prompt with the current LoRA, conditioned on the score it just wrote (or a fixed `probe_abc`), up to
+  that many seconds, and reports its length, whether it ended and the share of distinct tokens (a collapsing
+  LoRA repeats itself). The tokens land next to the score as `step_000025.semantic.npy`. This is the
+  over-training signal for `train_semantic`: compare each checkpoint with step 0, and treat a stream that
+  ends far earlier than the base model's, or whose distinct share drops, as over-trained on the music-token
+  target. About a minute per 60 s.
 - The planner learns fast: every step supervises thousands of score tokens, so 25-100 steps at `5e-5`
   (the node defaults are 100 steps, `5e-5`, cosine) already reshape the writing. Watch the held-out eval
   line and the probes, and keep `save_every` small (5-25) so you can pick the best checkpoint. Treat the
@@ -315,6 +325,7 @@ For the planner, add probes (`probe_every`): the console then also shows
 
 ```
 YuE2 planner probe step 25/100  3103 ABC tokens in 1:52, ended normally  (step 0: 2871 tokens)  -> .../step_000025.abc
+YuE2 planner music probe step 25/100  1500 music tokens (60.0 s, 61% distinct) in 1:05, ran the whole 60-s budget  (step 0: 1500 tokens, 63% distinct)
 YuE2 planner probe step 50/100  8192 ABC tokens in 4:40, HIT THE TOKEN BUDGET without ending (over-trained or album-length scores)
 ```
 
@@ -323,7 +334,8 @@ worth keeping; with a regularization set connected the `regularizer loss` line s
 value.
 
 Turn on `tensorboard` to also log `loss/step`, `loss/avg20`, `loss/eval_heldout` (or `loss/eval_fixed`),
-`loss/eval_regularizer`, `probe/abc_tokens`, `probe/ended`, `lr` and `grad_norm` per step, plus the run
+`loss/eval_regularizer`, `probe/abc_tokens`, `probe/ended`, `probe/music_tokens`, `probe/music_ended`,
+`probe/music_distinct`, `lr` and `grad_norm` per step, plus the run
 configuration and final result as text. Runs land in `ComfyUI/output/yue2_tensorboard/<save_name>_<timestamp>`
 (`tensorboard_dir` changes the parent folder); view them with
 
@@ -371,7 +383,8 @@ C:/ai/ComfyUI/venv/Scripts/python.exe train_cli.py planner --comfy-root C:/ai/Co
 everything and trains 0 steps. `--devices cuda:1` picks a GPU, `--devices all` uses every GPU data-parallel
 (see *Choosing GPUs*). Planner extras: `--regularization DIR` (+ `--regularization-fraction`) mixes in a
 folder of base-model scores, `--probe-every N` (+ `--probe-style`, `--probe-lyrics` or `@file`,
-`--probe-max-tokens`, `--probe-dir`) writes probe scores to `<out>_probes/`.
+`--probe-max-tokens`, `--probe-music-seconds`, `--probe-abc`, `--probe-dir`) writes probe scores (and music
+tokens) to `<out>_probes/`.
 
 ## How it works
 

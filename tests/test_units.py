@@ -32,7 +32,8 @@ def test_scan_folder_sidecars(tmp_path):
     _wav(tmp_path / "c.wav")
     out = tmp_path / "yue2_out"
     out.mkdir()
-    (out / "request.json").write_text(json.dumps({"id": "gen1", "style": "pop", "lyrics": "x", "cot": "full"}), encoding="utf-8")
+    (out / "request.json").write_text(json.dumps({"id": "gen1", "style": "pop", "lyrics": "x", "cot": "full",
+                                                  "semantic_ended": False}), encoding="utf-8")
     np.save(out / "semantic.npy", np.arange(50, dtype=np.int32))
     np.save(out / "latent.npy", np.zeros((50, 64), dtype=np.float32))
     (out / "score.abc").write_text("X:1\nK:C\nC D|", encoding="utf-8")
@@ -48,6 +49,7 @@ def test_scan_folder_sidecars(tmp_path):
     gen = by_id["gen1"]
     assert gen.latents.shape == (64, 50) and gen.semantic == list(range(50)) and gen.abc.startswith("X:1")
     assert gen.audio_path.endswith("audio.flac") and gen.seconds == 2.0
+    assert gen.extra["semantic_ended"] is False
 
 
 def test_cache_roundtrip(tmp_path):
@@ -343,12 +345,39 @@ def test_monitor_resume_eta_and_probe_lines(caplog):
         m.step(51, 1.0, 1e-4, 0.5)
         m.eval(60, 1.4, drift=0.9)
         m.probe(60, 3100, True, 12.0, path="x/step_000060.abc")
-        m.probe(80, 8192, False, 30.0)
+        m.probe(80, 8192, False, 30.0, music={"tokens": 1500, "seconds": 60.0, "ended": False, "distinct": 0.61,
+                                              "budget_seconds": 60.0, "generation_seconds": 65.0})
+        m.probe(90, 3000, True, 20.0, music={"tokens": 900, "seconds": 36.0, "ended": True, "distinct": 0.4,
+                                             "budget_seconds": 60.0, "generation_seconds": 40.0})
+        m.close()
     text = caplog.text
     assert "step 51/100" in text and "eta" in text
     assert "best 1.4000" in text and "regularizer loss 0.9000" in text
     assert "3100 ABC tokens" in text and "HIT THE TOKEN BUDGET" in text
-    assert m.probes[-1]["ended"] is False and m.drift == [(60, 0.9)]
+    assert "1500 music tokens (60.0 s, 61% distinct) in 1:05, ran the whole 60-s budget" in text
+    assert "900 music tokens (36.0 s, 40% distinct) in 0:40, ended on its own  (step 80: 1500 tokens, 61% distinct)" in text
+    assert "step 80: 8192 tokens (budget hit), music 1500 tokens (budget, 61% distinct); step 90: 3000 tokens, music 900 tokens (ended, 40% distinct)" in text
+    assert m.probes[1]["ended"] is False and m.probes[-1]["music"]["ended"] is True and m.drift == [(60, 0.9)]
+
+
+def test_planner_semantic_sequence_ends_only_when_the_stream_ended():
+    from types import SimpleNamespace
+    from yue2_trainer.constants import CODEC_OFFSET, MUSIC_END, MUSIC_START
+    from yue2_trainer.dataset import Dataset, Item
+    from yue2_trainer.planner import PlannerConfig, build_sequences
+
+    class _Tok:
+        def encode(self, text):
+            return SimpleNamespace(ids=[1000 + (ord(c) % 50) for c in text])
+
+    clip = SimpleNamespace(tokenizer=SimpleNamespace(tokenizer=_Tok()))
+    whole = Item(id="song", audio_path=None, style="rock", lyrics="la", semantic=[5, 6, 7])
+    cut = Item(id="reg", audio_path=None, style="rock", lyrics="la", semantic=[8, 9], extra={"semantic_ended": False})
+    seqs = build_sequences(clip, Dataset(items=[whole, cut]), PlannerConfig(train_abc=False, train_semantic=True))
+    assert [s.kind for s in seqs] == ["semantic", "semantic"]
+    assert seqs[0].ids[seqs[0].loss_start - 1] == MUSIC_START
+    assert seqs[0].ids[seqs[0].loss_start:] == [5 + CODEC_OFFSET, 6 + CODEC_OFFSET, 7 + CODEC_OFFSET, MUSIC_END]
+    assert seqs[1].ids[seqs[1].loss_start:] == [8 + CODEC_OFFSET, 9 + CODEC_OFFSET]
 
 
 def test_semantic_windows_cover_every_frame_once():
