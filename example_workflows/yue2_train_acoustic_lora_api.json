@@ -96,6 +96,7 @@
    "eval_holdout": 1,
    "resume_state": true,
    "keep": "best_eval",
+   "ema_decay": 0.99,
    "vae": [
     "1",
     2

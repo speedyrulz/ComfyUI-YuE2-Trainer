@@ -89,16 +89,19 @@
    "probe_every": 10,
    "probe_style": "",
    "probe_lyrics": "",
-   "probe_music_seconds": 60.0,
    "probe_max_tokens": 8192,
    "probe_seed": 0,
    "probe_abc": "",
-   "probe_render_device": "auto",
+   "sample_every": 10,
+   "sample_seconds": 60.0,
+   "sample_seed": 0,
+   "sample_device": "auto",
    "regularization": [
     "11",
     0
    ],
    "keep": "final",
+   "ema_decay": 0.9,
    "model": [
     "1",
     0

@@ -10,9 +10,11 @@ from typing import Callable, Optional
 
 import torch
 
-from .acoustic import TrainResult, _check_trainable_weights, _keep, _make_optimizer, _lr_at, split_holdout
+from .acoustic import (TrainResult, _average_state, _check_trainable_weights, _keep, _make_optimizer, _lr_at,
+                       _restore_average, split_holdout)
 from .constants import CLIP_KEY_PREFIX, CODEC_OFFSET, CODEC_SIZE, CONTEXT, FRAMES_PER_SECOND, MUSIC_END
 from .dataset import CHORD_RE, Dataset, Item
+from .ema import WeightAverage, averaged
 from .forward import ar_hidden, chunked_cross_entropy, chunked_losses
 from .lora import adapter_weights_as, create_lora, select_target_modules, count_parameters
 from .monitor import TrainMonitor
@@ -53,6 +55,7 @@ class PlannerConfig:
     eval_samples: int = 8               # size of the fixed evaluation set
     eval_holdout: int = 1               # songs kept out of training and used for the evaluation set (0 = score training crops)
     keep: str = "final"                # final | best_eval: which weights the trainer returns
+    ema_decay: float = 0.0             # EMA of the LoRA weights, warm-started (0 = off); see ema.py
     regularization_fraction: float = 0.5   # share of micro-steps drawn from the regularization scores (when given)
     kl_weight: float = 0.0              # trust region: weight of KL(base || LoRA) on the trained positions (0 = off)
     abc_dropout: float = 0.0            # share of semantic draws trained with the no-sheet (cot off) prompt
@@ -62,8 +65,11 @@ class PlannerConfig:
     probe_mode: str = ""                # blank = abc_mode (full when abc_mode is auto)
     probe_max_tokens: int = 8192        # token budget of a probe; a probe that uses it all did not end its score
     probe_seed: int = 0
-    probe_music_seconds: float = 0.0    # also write the music-token stream for the probe prompt, up to this many seconds (0 = off)
-    probe_abc: str = ""                 # fixed score for the music probes (blank = the score each probe writes)
+    probe_abc: str = ""                 # fixed score for the samples (blank = the score each probe writes)
+    sample_every: int = 0               # every N steps (and before step 1) write a song clip with the current LoRA: score,
+                                        # sample_seconds of music tokens, audio through render_callback (0 = off)
+    sample_seconds: float = 30.0
+    sample_seed: int = 0                # seed of a sample's music tokens and of its rendering
     probe_callback: Optional[Callable[..., Optional[str]]] = None   # (step, abc, meta, music_tokens | None) -> saved path
     render_callback: Optional[Callable[..., Optional[str]]] = None  # (step, conditioning, frames, meta) -> audio path
     tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
@@ -347,6 +353,10 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
     optimizer = _make_optimizer(cfg.optimizer, primary.lora.trainable, cfg.learning_rate, cfg.weight_decay)
     logging.info("YuE2 trainer: %.2fM trainable LoRA parameters on %s", count_parameters(primary.lora.trainable) / 1e6,
                  ", ".join(str(d) for d in devices))
+    average = WeightAverage(primary.lora.trainable, cfg.ema_decay) if cfg.ema_decay > 0 else None
+    if average is not None:
+        logging.info("YuE2 trainer: averaging the LoRA weights (EMA, decay %.4g, warm-started); evaluation, probes, "
+                     "samples, checkpoints and the result use the average", cfg.ema_decay)
 
     micro_steps = cfg.batch_size * cfg.grad_accumulation
     if micro_steps < len(devices):
@@ -367,6 +377,7 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
         losses, evals = list(restored["losses"]), [list(e) for e in restored["evals"]]
         drift, probes = [list(e) for e in restored.get("drift", [])], list(restored.get("probes", []))
         kls = list(restored.get("kl", []))
+        _restore_average(average, restored, replicas)
         if start_step >= cfg.steps:
             raise ValueError(f"The resumed run is already at step {start_step}; set steps above it to continue "
                              "(or turn resume_state off to start a new run from the LoRA weights)")
@@ -377,7 +388,8 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             "regularization_sequences": len(reg_sequences),
             "regularization_fraction": cfg.regularization_fraction if reg_sequences else 0.0,
             "kl_weight": cfg.kl_weight, "kl": kls, "abc_dropout": cfg.abc_dropout,
-            "probe_every": cfg.probe_every, "probe_music_seconds": cfg.probe_music_seconds, "resumed_from": start_step,
+            "probe_every": cfg.probe_every, "sample_every": cfg.sample_every, "sample_seconds": cfg.sample_seconds,
+            "ema_decay": cfg.ema_decay, "resumed_from": start_step,
             "sequences": len(sequences), "train_abc": cfg.train_abc, "train_semantic": cfg.train_semantic,
             "max_tokens": cfg.max_tokens, "learning_rate": cfg.learning_rate, "lr_schedule": cfg.lr_schedule,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
@@ -417,18 +429,25 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
         return total
 
     best: dict = {}
+    render_failed: list = []
 
     def run_eval(index: int):
-        value = _evaluate(primary, eval_set)
-        evals.append([index, value])
-        moved = _evaluate(primary, drift_set) if drift_set else None
-        if moved is not None:
-            drift.append([index, moved])
-        monitor.eval(index, value, moved)
-        if cfg.keep == "best_eval" and index > 0 and (not best or value < best["eval"]):
-            best.update(step=index, eval=value, lora_sd=primary.lora.export(), state=state_at(index))
+        with averaged(average):
+            value = _evaluate(primary, eval_set)
+            evals.append([index, value])
+            moved = _evaluate(primary, drift_set) if drift_set else None
+            if moved is not None:
+                drift.append([index, moved])
+            monitor.eval(index, value, moved)
+            if cfg.keep == "best_eval" and index > 0 and (not best or value < best["eval"]):
+                best.update(step=index, eval=value, lora_sd=primary.lora.export(), state=state_at(index))
 
-    def run_probe(index: int):
+    def run_probe(index: int, with_music: bool):
+        """A probe score; with ``with_music`` also the sample: music tokens for it, rendered through render_callback."""
+        with averaged(average):
+            _run_probe(index, with_music)
+
+    def _run_probe(index: int, with_music: bool):
         started = time.perf_counter()
         with _adapter_weights_as(primary.lora, torch.bfloat16):
             text, count, ended = generate_abc(primary.extra["clip"], probe_style, probe_lyrics, probe_mode,
@@ -438,37 +457,45 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
                 "lyrics": probe_lyrics, "mode": probe_mode, "seed": cfg.probe_seed, "max_tokens": cfg.probe_max_tokens}
         entry = {"step": index, "tokens": count, "ended": ended, "seconds": round(seconds, 1)}
         codes = music = None
-        if cfg.probe_music_seconds > 0:
+        if with_music:
             abc, source = probe_score(text, ended)
             mode = resolve_mode("auto", abc, bool(abc and CHORD_RE.search(abc)))
             started = time.perf_counter()
             with _adapter_weights_as(primary.lora, torch.bfloat16):
                 codes, music_ended = generate_music(primary.extra["clip"], probe_style, probe_lyrics, abc, mode,
-                                                    cfg.probe_seed, cfg.probe_music_seconds)
+                                                    cfg.sample_seed, cfg.sample_seconds)
             music = {"tokens": len(codes), "seconds": round(len(codes) / FRAMES_PER_SECOND, 1), "ended": music_ended,
                      "distinct": round(len(set(codes)) / max(1, len(codes)), 3), "abc_source": source, "mode": mode,
-                     "budget_seconds": cfg.probe_music_seconds,
+                     "budget_seconds": cfg.sample_seconds,
                      "generation_seconds": round(time.perf_counter() - started, 1)}
-            meta["music"] = {**music, "abc": abc or ""}
+            meta["music"] = {**music, "abc": abc or "", "seed": cfg.sample_seed}
             entry["music"] = music
+        if cfg.render_callback and codes and not render_failed:
+            started = time.perf_counter()
+            try:
+                with _adapter_weights_as(primary.lora, torch.bfloat16):
+                    conditioning = conditioning_from_tokens(primary.extra["clip"], probe_style, probe_lyrics, abc, mode, codes)
+                audio_path = cfg.render_callback(index, conditioning, len(codes), meta)
+                del conditioning
+            except Exception as exc:  # noqa: BLE001 - rendering is auxiliary; the tokens are still written
+                if type(exc).__name__ == "InterruptProcessingException":
+                    raise
+                render_failed.append(str(exc))
+                logging.warning("YuE2 trainer: rendering the sample failed (%s); later samples stay token files "
+                                "(render them with YuE2 Conditioning From Tokens)", exc)
+                audio_path = None
+            if audio_path:
+                music["audio"] = meta["music"]["audio"] = str(audio_path)
+                music["render_seconds"] = meta["music"]["render_seconds"] = round(time.perf_counter() - started, 1)
         path = cfg.probe_callback(index, text, meta, codes) if cfg.probe_callback else None
         if path:
             entry["path"] = str(path)
-        if cfg.render_callback and codes:
-            started = time.perf_counter()
-            with _adapter_weights_as(primary.lora, torch.bfloat16):
-                conditioning = conditioning_from_tokens(primary.extra["clip"], probe_style, probe_lyrics, abc, mode, codes)
-            audio_path = cfg.render_callback(index, conditioning, len(codes), meta)
-            del conditioning
-            if audio_path:
-                music["audio"] = str(audio_path)
-                music["render_seconds"] = round(time.perf_counter() - started, 1)
         probes.append(entry)
         monitor.probe(index, count, ended, seconds, path, music=music)
 
     def state_at(step: int) -> dict:
         return capture_state("planner", cfg, step, optimizer, replicas, losses, evals,
-                             extra={"drift": drift, "probes": probes, "kl": kls})
+                             extra={"drift": drift, "probes": probes, "kl": kls, **_average_state(average)})
 
     def due(step: int, every: int) -> bool:
         return every > 0 and (step % every == 0 or step == cfg.steps)
@@ -477,8 +504,8 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
     try:
         if eval_set and not (evals and evals[-1][0] == start_step):
             run_eval(start_step)
-        if cfg.probe_every > 0 and not (probes and probes[-1]["step"] == start_step):
-            run_probe(start_step)
+        if (cfg.probe_every > 0 or cfg.sample_every > 0) and not (probes and probes[-1]["step"] == start_step):
+            run_probe(start_step, cfg.sample_every > 0)
         for step in range(start_step, cfg.steps):
             if interrupt_check is not None:
                 interrupt_check()
@@ -490,6 +517,8 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             grad_norm = float(torch.nn.utils.clip_grad_norm_(primary.lora.trainable, cfg.max_grad_norm or float("inf")))
             optimizer.step()
             sync_lora_weights(replicas)
+            if average is not None:
+                average.update()
             step_loss = float(sums[0]) / micro_steps
             losses.append(step_loss)
             extra = None
@@ -499,13 +528,14 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             monitor.step(step + 1, step_loss, optimizer.param_groups[0]["lr"], grad_norm, extra)
             if eval_set and due(step + 1, cfg.eval_every):
                 run_eval(step + 1)
-            if due(step + 1, cfg.probe_every):
-                run_probe(step + 1)
+            if due(step + 1, cfg.probe_every) or due(step + 1, cfg.sample_every):
+                run_probe(step + 1, due(step + 1, cfg.sample_every))
             if progress is not None:
                 progress(step + 1, cfg.steps, step_loss)
             if cfg.save_every and cfg.save_callback and (step + 1) % cfg.save_every == 0 and step + 1 < cfg.steps:
-                cfg.save_callback(primary.lora.export(), step + 1,
-                                  {**info, "steps": step + 1, "partial": True, "loss": step_loss}, state_at(step + 1))
+                with averaged(average):
+                    cfg.save_callback(primary.lora.export(), step + 1,
+                                      {**info, "steps": step + 1, "partial": True, "loss": step_loss}, state_at(step + 1))
         final_state = state_at(cfg.steps)
     finally:
         comfy.model_management.in_training = False
@@ -520,7 +550,11 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
             comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
 
-    exported = primary.lora.export()
+    raw = primary.lora.export() if average is not None else None
+    with averaged(average):
+        exported = primary.lora.export()
+    if average is not None:
+        info["ema_updates"] = average.updates
     for adapter in primary.lora.adapters:
         adapter.requires_grad_(False)
     info["tensorboard"] = str(monitor.log_dir) if monitor.log_dir else None
@@ -528,7 +562,8 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
         info["eval_loss_start"], info["eval_loss_final"] = evals[0][1], evals[-1][1]
     exported, final_state = _keep(cfg, best, exported, final_state, info, "planner")
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,
-                       seconds=time.perf_counter() - start_time, info=info, evals=evals, state=final_state)
+                       seconds=time.perf_counter() - start_time, info=info, evals=evals, state=final_state,
+                       raw_lora_sd=raw)
 
 
 __all__ = ["PlannerConfig", "train_planner_lora", "build_sequences", "build_eval_set", "CROP_CONTEXT",

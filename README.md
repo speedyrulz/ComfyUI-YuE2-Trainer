@@ -124,7 +124,7 @@ C:/ai/ComfyUI/venv/Scripts/python.exe prepare_dataset.py D:/songs --sections cla
 | **YuE2 Semantic Tokens (community head)** | Predict YuE2 semantic tokens for every recording with the Mothersuperior v4 head (MERT-v2-FullSong + small transformer) and write `<song>.semantic.npy`. Enables `train_semantic` / `use_semantic_tokens` on real songs. |
 | **YuE2 Encode Dataset** | VAE-encode every item to latents in fp32 (cached under `output/yue2_trainer_cache`), optionally transcribe missing ABC with a SheetSage2 `AUDIO_ENCODER`. |
 | **YuE2 Train Acoustic LoRA (MODEL)** | Flow-matching LoRA training of the acoustic model. Outputs `LORA_MODEL`, `LOSS_MAP`, steps, a text report. |
-| **YuE2 Train Planner LoRA (CLIP)** | Next-token LoRA training of the language model on ABC (and semantic tokens when present). Optional regularization input and checkpoint probes (see below). |
+| **YuE2 Train Planner LoRA (CLIP)** | Next-token LoRA training of the language model on ABC (and semantic tokens when present). Optional regularization input, checkpoint probes and rendered song clips (see below). |
 | **YuE2 Regularization Scores** | Writes ABC scores with the base model for a few prompts (and, with `music_seconds`, the base model's music tokens for each score) and returns them as a dataset for the planner trainer's `regularization` input (saved under `output/yue2_regularization`, reused on later runs). |
 | **YuE2 Save LoRA** | Writes the LoRA to `models/loras/<name>.safetensors` with training metadata; with `name` blank and `loss_map` connected it uses the trainer's `save_name`. The core `SaveLoRA` node also works (it writes to `output/`). |
 | **YuE2 Load LoRA** | Applies a LoRA to MODEL and/or CLIP; either input can be left unconnected. |
@@ -140,7 +140,8 @@ or use *Load*; recent frontends import API-format JSON):
 
 - `yue2_train_acoustic_lora_api.json` – checkpoint → dataset → encode (SheetSage2 `full` transcription) →
   **YuE2 Semantic Tokens** → acoustic LoRA (`inference_like` conditioning on the songs' semantic tokens, rank 32,
-  1000 steps, `keep` = best_eval, checkpoints and a rendered 30-s sample every 250) → save + loss plot; needs
+  1000 steps, `keep` = best_eval, `ema_decay` 0.99, checkpoints and a rendered 30-s sample every 250) → save +
+  loss plot; needs
   the community tokenizer head
 - `yue2_prepare_and_train_acoustic_api.json` – the text-only variant (no transcription or tokenizer head):
   **Prepare Dataset** generates the style/lyrics sidecars, then `compact` acoustic training
@@ -149,8 +150,9 @@ or use *Load*; recent frontends import API-format JSON):
   node (base scores for the dataset's own prompts) on the `regularization` input
 - `yue2_train_semantic_planner_api.json` – the planner graph with **YuE2 Semantic Tokens** between encoding and
   training and both targets on (`train_abc` + `train_semantic`, rank 32, 80 linear steps, a checkpoint and eval
-  every 5 steps, an ABC + 60-s music probe every 10 rendered on the second GPU, regularization scores with 120 s of base-model music
-  tokens at 0.2, `kl_weight` 0.5); needs the community tokenizer head (see *Semantic tokens for your own
+  every 5 steps, a probe score and a 60-s song clip every 10 steps rendered on the second GPU (`sample_every`),
+  `ema_decay` 0.9, regularization scores with 120 s of base-model music tokens at 0.2, `kl_weight` 0.5); needs
+  the community tokenizer head (see *Semantic tokens for your own
   recordings*)
 - `yue2_generate_with_lora_api.json` – the stock YuE2 generation graph with two **YuE2 Load LoRA** nodes between
   the checkpoint loader and the YuE2 nodes: the acoustic LoRA on the MODEL path, the planner LoRA on the CLIP path
@@ -224,6 +226,17 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   back the checkpoint at the minimum. The final step stays the default because, for the planner, the
   checkpoint that sounds closest to the album is often a little past the held-out minimum; `save_every`
   checkpoints let you compare both.
+- `ema_decay` (0 = off): exponential moving average of the LoRA weights. The average is what the node
+  outputs and what evaluation, probes, samples and checkpoints use; the last step's raw weights are saved
+  next to the final LoRA as `<name>_raw.safetensors` (by **YuE2 Save LoRA** and by the CLI) so the two can
+  be compared. The average is warm-started (the t-th update uses min(decay, (1 + t) / (10 + t))), so the
+  zero-effect initial weights are not frozen into it; an average that applies the full decay from step 1
+  still holds a third of the init after 1,000 steps at 0.999 and needs a raised strength to compensate.
+  Roughly the last 1 / (1 - decay) steps count: 0.9 for an 80-100 step planner run, 0.99 for a 1,000-step
+  acoustic run. It smooths the checkpoint-to-checkpoint variance (a planner whose steps 50, 55 and 60 sound
+  quite different) at no training cost, and the resume state carries the average, so a resumed run
+  continues it. With `keep` = best_eval the kept checkpoint is the average at that step; the raw file is
+  always the last step's live weights.
 
 **Planner LoRA**
 
@@ -274,19 +287,21 @@ An acoustic LoRA only affects the KSampler stage; a planner LoRA only affects th
   them into `YuE2GenerateMusic`'s `abc` input and listen to what each checkpoint writes. Each probe costs as
   much as one `YuE2GenerateABC` run (a minute or two for a 3,000-token score, more for one that hits the
   cap).
-- `probe_music_seconds` (0 = off): with probes on, each probe also writes the music-token stream for the
-  probe prompt with the current LoRA, conditioned on the score it just wrote (or a fixed `probe_abc`), up to
-  that many seconds, and reports its length, whether it ended and the share of distinct tokens (a collapsing
-  LoRA repeats itself). The tokens land next to the score as `step_000025.semantic.npy`. This is the
-  over-training signal for `train_semantic`: compare each checkpoint with step 0, and treat a stream that
-  ends far earlier than the base model's, or whose distinct share drops, as over-trained on the music-token
-  target. About a minute per 60 s. To hear a probe, point **YuE2 Conditioning From Tokens** at its
-  `.semantic.npy` (with the same checkpoint on the CLIP path) and run the stock acoustic stage; the example
-  graph `yue2_render_tokens_api.json` does exactly that. Or connect the checkpoint's `model` and `vae` to the
-  planner node: every music probe is then also rendered to `step_000025.wav` next to its tokens, on a GPU that
-  training is not using (`probe_render_device`: auto picks one, or name it). The acoustic model does not fit
-  next to the planner and its training state on a 16 GB card, so with one GPU leave the inputs unconnected and
-  render afterwards.
+- `sample_every` (0 = off) / `sample_seconds` (30): every N steps, and before step 1, the planner writes a
+  song clip with the current LoRA, the counterpart of the acoustic trainer's `sample_every`: a score for the
+  probe prompt (a fixed `probe_abc` if given), then `sample_seconds` of music tokens conditioned on it, and
+  with the checkpoint's `model` and `vae` connected the clip is rendered to
+  `output/yue2_probes/<save_name>/step_000025.wav` next to its score and tokens (`step_000025.semantic.npy`),
+  on a GPU that training is not using (`sample_device`: auto picks one, or name it, or `off` to keep the
+  tokens only). Step 0 is the base model. The log reports the stream's length, whether it ended and its share
+  of distinct tokens (a collapsing LoRA repeats itself): compare each checkpoint with step 0 and treat a
+  stream that ends far earlier than the base model's, or whose distinct share drops, as over-trained on the
+  music-token target. This is the over-training signal for `train_semantic`. About a minute per 60 s of
+  tokens plus the render. A sample step also counts as a probe: its score is saved and reported like one, so
+  `probe_every` can stay small while clips are made less often. The acoustic model does not fit next to the
+  planner and its training state on a 16 GB card, so with one GPU set `sample_device` off and render the
+  tokens afterwards with **YuE2 Conditioning From Tokens** (the `yue2_render_tokens_api.json` graph does
+  exactly that).
 - The planner learns fast: every step supervises thousands of score tokens, so 25-100 steps at `5e-5`
   (the node defaults are 100 steps, `5e-5`, cosine) already reshape the writing. Watch the held-out eval
   line and the probes, and keep `save_every` small (5-25) so you can pick the best checkpoint. Treat the
@@ -362,7 +377,7 @@ For the planner, add probes (`probe_every`): the console then also shows
 
 ```
 YuE2 planner probe step 25/100  3103 ABC tokens in 1:52, ended normally  (step 0: 2871 tokens)  -> .../step_000025.abc
-YuE2 planner music probe step 25/100  1500 music tokens (60.0 s, 61% distinct) in 1:05, ran the whole 60-s budget  (step 0: 1500 tokens, 63% distinct)
+YuE2 planner sample step 25/100  1500 music tokens (60.0 s, 61% distinct) in 1:05, ran the whole 60-s budget  (step 0: 1500 tokens, 63% distinct)
 YuE2 planner probe step 50/100  8192 ABC tokens in 4:40, HIT THE TOKEN BUDGET without ending (over-trained or album-length scores)
 ```
 
@@ -426,8 +441,9 @@ C:/ai/ComfyUI/venv/Scripts/python.exe train_cli.py planner --comfy-root C:/ai/Co
 everything and trains 0 steps. `--devices cuda:1` picks a GPU, `--devices all` uses every GPU data-parallel
 (see *Choosing GPUs*). Planner extras: `--regularization DIR` (+ `--regularization-fraction`) mixes in a
 folder of base-model scores, `--kl-weight` and `--abc-dropout` match the node options, `--probe-every N` (+ `--probe-style`, `--probe-lyrics` or `@file`,
-`--probe-max-tokens`, `--probe-music-seconds`, `--probe-abc`, `--probe-dir`) writes probe scores (and music
-tokens) to `<out>_probes/`, `--probe-render` (+ `--probe-render-device`) renders them on a second GPU. Acoustic
+`--probe-max-tokens`, `--probe-abc`, `--probe-dir`) writes probe scores to `<out>_probes/`, `--sample-every N`
+(+ `--sample-seconds`, `--sample-seed`, `--sample-device`) writes song clips there (tokens, and audio on a GPU
+training does not use). `--ema-decay` averages the weights on both trainers (raw copy at `<out>_raw`). Acoustic
 extras: `--sample-every N` (+ `--sample-tokens`, `--sample-seconds`, `--sample-seed`) renders a fixed stream with
 the LoRA under training. `train_cli.py merge acoustic.safetensors planner.safetensors --out both.safetensors`
 writes one file from two.

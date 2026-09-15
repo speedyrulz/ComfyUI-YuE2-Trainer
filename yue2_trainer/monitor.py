@@ -131,7 +131,7 @@ class TrainMonitor:
                 self.writer.add_scalar("probe/music_distinct", music.get("distinct", 0.0), index)
             earlier = next((p for p in self.probes[:-1] if p.get("music")), None)
             verdict = "ended on its own" if music["ended"] else f"ran the whole {music.get('budget_seconds', 0.0):.0f}-s budget"
-            LOG.info("YuE2 %s music probe step %d/%d  %d music tokens (%.1f s, %.0f%% distinct) in %s, %s%s%s",
+            LOG.info("YuE2 %s sample step %d/%d  %d music tokens (%.1f s, %.0f%% distinct) in %s, %s%s%s",
                      self.kind, index, self.total, music["tokens"], music.get("seconds", 0.0),
                      music.get("distinct", 0.0) * 100.0, _fmt_seconds(music.get("generation_seconds", 0.0)), verdict,
                      f"  (step {earlier['step']}: {earlier['music']['tokens']} tokens, "

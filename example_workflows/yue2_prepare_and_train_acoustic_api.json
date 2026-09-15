@@ -95,7 +95,8 @@
    "eval_samples": 8,
    "eval_holdout": 1,
    "resume_state": true,
-   "keep": "final"
+   "keep": "final",
+   "ema_decay": 0.0
   }
  },
  "5": {

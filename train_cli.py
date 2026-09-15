@@ -134,6 +134,10 @@ def save_result(result, args, kind: str):
     if getattr(result, "state", None):
         from yue2_trainer.resume import save_state, state_path
         save_state(result.state, state_path(out))
+    if getattr(result, "raw_lora_sd", None):
+        raw = out.with_name(out.stem + "_raw.safetensors")
+        save_lora_file(result.raw_lora_sd, raw, {**info, "weights": "raw (not averaged)"})
+        logging.info("saved the last step's raw (not averaged) weights to %s", raw)
     logging.info("saved %s LoRA (%d tensors) to %s", kind, len(result.lora_sd), out)
     return out
 
@@ -170,6 +174,9 @@ def add_common(p):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--optimizer", default="AdamW")
     p.add_argument("--lora-dtype", default="fp32", choices=["fp32", "bf16"])
+    p.add_argument("--ema-decay", type=float, default=0.0,
+                   help="EMA of the LoRA weights, warm-started (0 = off): the result is the average, the last step's raw "
+                        "weights go to <out>_raw.safetensors.")
     p.add_argument("--no-checkpointing", action="store_true")
     p.add_argument("--devices", default="auto",
                    help="auto | cuda:N | all (data parallel on every GPU) | cuda:0,cuda:1")
@@ -230,15 +237,16 @@ def main(argv=None):
     pp.add_argument("--probe-lyrics", default="", help="Probe lyrics, or @file to read them from a file.")
     pp.add_argument("--probe-max-tokens", type=int, default=8192)
     pp.add_argument("--probe-seed", type=int, default=0)
-    pp.add_argument("--probe-music-seconds", type=float, default=0.0,
-                    help="Also write the music-token stream for the probe prompt with the current LoRA, up to N seconds "
-                         "(saved as step_NNNNNN.semantic.npy next to the score); 0 = off.")
     pp.add_argument("--probe-abc", default="",
                     help="Fixed ABC score for the music probes, or @file (default: the score each probe writes).")
     pp.add_argument("--probe-dir", default=None, help="Where probe scores are written (default: <out>_probes/).")
-    pp.add_argument("--probe-render", action="store_true",
-                    help="Render every music probe to step_NNNNNN.wav on --probe-render-device (needs a GPU training does not use).")
-    pp.add_argument("--probe-render-device", default="auto", help="auto (a GPU not used for training) or cuda:N.")
+    pp.add_argument("--sample-every", type=int, default=0,
+                    help="Every N steps (and before step 1) write a song clip with the current LoRA: score, music tokens "
+                         "(step_NNNNNN.semantic.npy) and, on --sample-device, audio (step_NNNNNN.wav); 0 = off.")
+    pp.add_argument("--sample-seconds", type=float, default=30.0, help="Music length of each sample.")
+    pp.add_argument("--sample-seed", type=int, default=0)
+    pp.add_argument("--sample-device", default="auto",
+                    help="GPU that renders the samples: auto (one training does not use), cuda:N, or off (tokens only).")
     pm = sub.add_parser("merge", help="Write an acoustic and a planner LoRA into one file")
     pm.add_argument("parts", nargs="+", help="LoRA files to merge (their keys must not overlap).")
     pm.add_argument("--out", required=True, help="Output .safetensors path.")
@@ -350,7 +358,7 @@ def main(argv=None):
                                  gradient_checkpointing=not args.no_checkpointing, optimizer=args.optimizer,
                                  devices=args.devices, existing_lora=existing, resume_state=resume,
                                  log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
-                                 eval_holdout=args.eval_holdout, keep=args.keep,
+                                 eval_holdout=args.eval_holdout, keep=args.keep, ema_decay=args.ema_decay,
                                  tensorboard_dir=args.tensorboard or "",
                                  run_name=args.run_name or Path(args.out).stem, save_every=args.save_every, save_callback=save_partial,
                                  sample_every=args.sample_every if sample else 0, sample_seconds=args.sample_seconds,
@@ -370,18 +378,18 @@ def main(argv=None):
             if regularization is not None:
                 logging.info("regularization scores:\n%s", regularization.describe())
             render_callback = None
-            if args.probe_render and args.probe_every > 0 and args.probe_music_seconds > 0:
+            if args.sample_every > 0 and args.sample_device != "off":
                 from yue2_trainer.parallel import resolve_devices
                 from yue2_trainer.render import Renderer, pick_render_device
-                target = pick_render_device(args.probe_render_device, resolve_devices(args.devices))
+                target = pick_render_device(args.sample_device, resolve_devices(args.devices))
                 if target is None:
-                    logging.warning("--probe-render: no GPU free for rendering (training uses %s); probes stay as token files", args.devices)
+                    logging.warning("--sample-every: no GPU free for rendering (training uses %s); samples stay as token files", args.devices)
                 else:
                     renderer = Renderer(model, vae, target)
                     write_audio = audio_writer("step")
 
                     def render_callback(step, conditioning, frames, meta):
-                        audio, rate = renderer.render(conditioning, frames, args.probe_seed)
+                        audio, rate = renderer.render(conditioning, frames, args.sample_seed)
                         return write_audio(step, audio, rate)
             cfg = PlannerConfig(steps=steps, batch_size=args.batch_size, grad_accumulation=args.grad_accumulation,
                                 learning_rate=args.lr, lr_schedule=args.lr_schedule, rank=args.rank, alpha=args.alpha, targets=args.targets,
@@ -393,9 +401,10 @@ def main(argv=None):
                                 kl_weight=args.kl_weight, abc_dropout=args.abc_dropout,
                                 probe_every=args.probe_every, probe_style=args.probe_style, probe_lyrics=probe_lyrics,
                                 probe_max_tokens=args.probe_max_tokens, probe_seed=args.probe_seed, probe_callback=probe_writer,
-                                probe_music_seconds=args.probe_music_seconds, probe_abc=probe_abc, render_callback=render_callback,
+                                sample_every=args.sample_every, sample_seconds=args.sample_seconds, sample_seed=args.sample_seed,
+                                probe_abc=probe_abc, render_callback=render_callback,
                                 log_every=args.log_every, eval_every=args.eval_every, eval_samples=args.eval_samples,
-                                eval_holdout=args.eval_holdout, keep=args.keep,
+                                eval_holdout=args.eval_holdout, keep=args.keep, ema_decay=args.ema_decay,
                                 tensorboard_dir=args.tensorboard or "",
                                 run_name=args.run_name or Path(args.out).stem,
                                 save_every=args.save_every, save_callback=save_partial)

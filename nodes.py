@@ -483,6 +483,13 @@ def _common_training_inputs(default_lr, default_steps):
                        tooltip="Which weights the node outputs: the final step, or the checkpoint with the lowest evaluation "
                                "loss (best_eval; needs eval_every > 0). With eval_holdout 0 the evaluation measures fit, so "
                                "best_eval is then simply the last step. The resume state follows the kept step."),
+        io.Float.Input("ema_decay", default=0.0, min=0.0, max=0.9999, step=0.0001, round=0.0001,
+                       tooltip="Exponential moving average of the LoRA weights (0 = off). The average is what the node "
+                               "outputs and what evaluation, probes, samples and checkpoints use; the last step's raw "
+                               "weights are saved next to the final LoRA as <name>_raw.safetensors for comparison. "
+                               "Warm-started, so early steps are not frozen in. Smooths the checkpoint-to-checkpoint "
+                               "variance: roughly the last 1 / (1 - decay) steps count. Planner (80-100 steps): 0.9; "
+                               "acoustic (1000 steps): 0.99."),
         io.Boolean.Input("tensorboard", default=False,
                          tooltip="Log loss, learning rate and grad norm to TensorBoard (pip install tensorboard)."),
         io.String.Input("tensorboard_dir", default="yue2_tensorboard", advanced=True,
@@ -550,7 +557,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
                 steps, learning_rate, lr_schedule, rank, alpha, targets, batch_size, grad_accumulation,
                 warmup_steps, seed, optimizer, lora_dtype, gradient_checkpointing, max_grad_norm, devices,
                 existing_lora, resume_state, save_every, save_name, log_every, eval_every, eval_samples, eval_holdout,
-                keep, tensorboard, tensorboard_dir, vae=None):
+                keep, ema_decay, tensorboard, tensorboard_dir, vae=None):
         sample = None
         if sample_every > 0:
             if vae is None:
@@ -571,7 +578,7 @@ class YuE2TrainerAcousticLoRA(io.ComfyNode):
             timestep_sampling=timestep_sampling, shift=shift, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
-            resume_state=_resume_state(existing_lora, resume_state), keep=keep,
+            resume_state=_resume_state(existing_lora, resume_state), keep=keep, ema_decay=ema_decay,
             log_every=log_every, eval_every=eval_every, eval_samples=eval_samples, eval_holdout=eval_holdout,
             tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
             sample_every=sample_every if sample else 0, sample_seconds=sample_seconds, sample_seed=sample_seed,
@@ -640,33 +647,38 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
                                 tooltip="Style prompt for the probes (blank = the first training song's style)."),
                 io.String.Input("probe_lyrics", default="", multiline=True,
                                 tooltip="Lyrics for the probes (blank = the first training song's lyrics)."),
-                io.Float.Input("probe_music_seconds", default=0.0, min=0.0, max=900.0, step=1.0,
-                               tooltip="With probe_every: after each probe score, also write the music-token stream for "
-                                       "the probe prompt with the current LoRA (conditioned on the score the probe just "
-                                       "wrote), up to this many seconds, and report its length, whether it ended and how "
-                                       "repetitive it is. The tokens land next to the score as step_NNNNNN.semantic.npy. "
-                                       "This is the over-training signal for train_semantic. 0 = off. About a minute "
-                                       "per 60 s."),
                 io.Int.Input("probe_max_tokens", default=8192, min=256, max=20000, advanced=True,
                              tooltip="Token budget of a probe score; a probe that uses all of it did not end."),
                 io.Int.Input("probe_seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF, advanced=True,
                              tooltip="Fixed sampling seed shared by all probes so they are comparable."),
                 io.String.Input("probe_abc", default="", multiline=True, advanced=True,
-                                tooltip="Fixed ABC score for the music probes, so every checkpoint is measured on the same "
+                                tooltip="Fixed ABC score for the samples, so every checkpoint is measured on the same "
                                         "score (blank = the score each probe writes; if that one did not end, the first "
                                         "training song's score)."),
-                io.Combo.Input("probe_render_device", options=_render_device_choices(), default="auto",
-                               tooltip="With model and vae connected: render every music probe to audio "
-                                       "(step_NNNNNN.wav next to its tokens) on this GPU. auto = a GPU training does not "
-                                       "use; the acoustic model does not fit next to the planner and its training state on "
-                                       "a 16 GB card, so with one GPU render afterwards with YuE2 Conditioning From Tokens."),
+                io.Int.Input("sample_every", default=0, min=0, max=100000,
+                             tooltip="Every N steps (and before step 1), write a song clip with the current LoRA: the "
+                                     "planner writes a score for the probe prompt (the probe_abc score if given), then "
+                                     "sample_seconds of music tokens for it, and with model and vae connected the clip is "
+                                     "rendered to output/yue2_probes/<save_name>/step_NNNNNN.wav next to its score and "
+                                     "tokens. Step 0 is the base model. Also reports the stream's length, whether it "
+                                     "ended and how repetitive it is (the over-training signal for train_semantic). "
+                                     "0 = off. About a minute per 60 s of tokens plus the render."),
+                io.Float.Input("sample_seconds", default=30.0, min=1.0, max=900.0, step=1.0,
+                               tooltip="Length of each sample's music."),
+                io.Int.Input("sample_seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF, advanced=True,
+                             tooltip="Fixed seed for the samples' music tokens and rendering, so steps are comparable."),
+                io.Combo.Input("sample_device", options=_render_device_choices(), default="auto",
+                               tooltip="GPU that renders the samples (needs model and vae connected). auto = a GPU training "
+                                       "does not use; the acoustic model does not fit next to the planner and its training "
+                                       "state on a 16 GB card, so with one GPU set off (tokens are still written) and "
+                                       "render afterwards with YuE2 Conditioning From Tokens."),
                 *_common_training_inputs(5e-5, 100),
                 DATASET.Input("regularization", optional=True,
                               tooltip="Scores the BASE model wrote (YuE2 Regularization Scores node, or a folder of YuE2 "
                                       "output directories). Mixed into training at regularization_fraction so the "
                                       "LoRA does not forget how to write and end a score."),
-                io.Model.Input("model", optional=True, tooltip="MODEL from the checkpoint: with vae, renders the music probes."),
-                io.Vae.Input("vae", optional=True, tooltip="VAE from the checkpoint: with model, renders the music probes."),
+                io.Model.Input("model", optional=True, tooltip="MODEL from the checkpoint: with vae and sample_every, renders the samples."),
+                io.Vae.Input("vae", optional=True, tooltip="VAE from the checkpoint: with model and sample_every, renders the samples."),
             ],
             outputs=[LORA_MODEL.Output("lora", display_name="lora"), LOSS_MAP.Output("loss_map", display_name="loss_map"),
                      io.Int.Output("steps", display_name="steps"), io.String.Output("report", display_name="report")],
@@ -675,26 +687,29 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
     @classmethod
     def execute(cls, clip, dataset, train_abc, train_semantic, abc_mode, max_tokens, regularization_fraction,
                 kl_weight, abc_dropout,
-                probe_every, probe_style, probe_lyrics, probe_music_seconds, probe_max_tokens, probe_seed, probe_abc,
-                probe_render_device, steps, learning_rate, lr_schedule,
+                probe_every, probe_style, probe_lyrics, probe_max_tokens, probe_seed, probe_abc,
+                sample_every, sample_seconds, sample_seed, sample_device, steps, learning_rate, lr_schedule,
                 rank, alpha,
                 targets, batch_size, grad_accumulation, warmup_steps, seed, optimizer, lora_dtype,
                 gradient_checkpointing, max_grad_norm, devices, existing_lora, resume_state, save_every, save_name, log_every,
-                eval_every, eval_samples, eval_holdout, keep, tensorboard, tensorboard_dir, regularization=None,
+                eval_every, eval_samples, eval_holdout, keep, ema_decay, tensorboard, tensorboard_dir, regularization=None,
                 model=None, vae=None):
         render_callback = None
-        if model is not None and vae is not None and probe_every > 0 and probe_music_seconds > 0:
-            target = pick_render_device(probe_render_device, resolve_devices(devices))
+        if sample_every > 0 and (model is None or vae is None):
+            logging.warning("YuE2 trainer: sample_every is set but model/vae are not connected; the samples are written "
+                            "as token files only (render them with YuE2 Conditioning From Tokens)")
+        elif sample_every > 0:
+            target = pick_render_device(sample_device, resolve_devices(devices))
             if target is None:
-                logging.warning("YuE2 trainer: no GPU free for rendering the music probes (training uses %s, "
-                                "probe_render_device=%s); render them afterwards with YuE2 Conditioning From Tokens",
-                                devices, probe_render_device)
+                logging.warning("YuE2 trainer: no GPU free for rendering the samples (training uses %s, sample_device=%s); "
+                                "they are written as token files only (render them with YuE2 Conditioning From Tokens)",
+                                devices, sample_device)
             else:
                 renderer = Renderer(model, vae, target)
                 write_audio = _audio_writer(_probe_dir(save_name), "step")
 
                 def render_callback(step, conditioning, frames, meta):
-                    audio, rate = renderer.render(conditioning, frames, probe_seed)
+                    audio, rate = renderer.render(conditioning, frames, sample_seed)
                     return write_audio(step, audio, rate)
         cfg = PlannerConfig(
             steps=steps, batch_size=batch_size, grad_accumulation=grad_accumulation, learning_rate=learning_rate,
@@ -703,11 +718,12 @@ class YuE2TrainerPlannerLoRA(io.ComfyNode):
             abc_mode=abc_mode, max_tokens=max_tokens, warmup_steps=warmup_steps, max_grad_norm=max_grad_norm,
             seed=seed, lora_dtype=lora_dtype, gradient_checkpointing=gradient_checkpointing, optimizer=optimizer,
             devices=devices, existing_lora=_existing_lora(existing_lora), save_every=save_every,
-            resume_state=_resume_state(existing_lora, resume_state), keep=keep,
+            resume_state=_resume_state(existing_lora, resume_state), keep=keep, ema_decay=ema_decay,
             regularization_fraction=regularization_fraction, kl_weight=kl_weight, abc_dropout=abc_dropout,
             probe_every=probe_every, probe_style=probe_style, probe_lyrics=probe_lyrics,
             probe_max_tokens=probe_max_tokens, probe_seed=probe_seed, probe_callback=_probe_writer(save_name),
-            probe_music_seconds=probe_music_seconds, probe_abc=probe_abc, render_callback=render_callback,
+            sample_every=sample_every, sample_seconds=sample_seconds, sample_seed=sample_seed,
+            probe_abc=probe_abc, render_callback=render_callback,
             log_every=log_every, eval_every=eval_every, eval_samples=eval_samples, eval_holdout=eval_holdout,
             tensorboard_dir=_tensorboard_dir(tensorboard, tensorboard_dir), run_name=save_name,
         )
@@ -732,6 +748,8 @@ def _loss_map(result) -> dict:
             out[key] = result.info[key]
     if getattr(result, "state", None):
         out["state"] = result.state
+    if getattr(result, "raw_lora_sd", None):
+        out["raw_lora"] = result.raw_lora_sd
     return out
 
 
@@ -750,6 +768,9 @@ def _report(result) -> str:
     if result.info.get("kept_step") not in (None, result.steps):
         lines.append(f"kept the weights from step {result.info['kept_step']} (best evaluation loss "
                      f"{result.info.get('kept_eval', float('nan')):.4f}) instead of the final step")
+    if result.info.get("ema_decay"):
+        lines.append(f"weights: EMA of the LoRA (decay {result.info['ema_decay']}, {result.info.get('ema_updates', 0)} "
+                     "updates); the last step's raw weights are saved next to the final LoRA as <name>_raw.safetensors")
     drift = result.info.get("drift") or []
     if len(drift) > 1:
         lines.append(f"regularizer loss (base-model scores): {drift[0][1]:.4f} -> {drift[-1][1]:.4f}")
@@ -810,6 +831,10 @@ class YuE2TrainerSaveLoRA(io.ComfyNode):
         if loss_map and loss_map.get("state"):
             save_state(loss_map["state"], state_path(target))
             logging.info("YuE2 trainer: saved resume state next to %s", target)
+        if loss_map and loss_map.get("raw_lora"):
+            raw_target = target.with_name(f"{name}_raw.safetensors")
+            save_lora_file(loss_map["raw_lora"], raw_target, {**info, "weights": "raw (not averaged)"})
+            logging.info("YuE2 trainer: saved the last step's raw (not averaged) weights as %s", raw_target)
         return io.NodeOutput(str(target))
 
 

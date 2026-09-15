@@ -259,6 +259,35 @@ def test_decode_audio_with_a_vae_built_under_inference_mode():
             assert next(vae.first_stage_model.parameters()).device.type == "cpu"
 
 
+def test_weight_average_warm_start_apply_and_resume():
+    from yue2_trainer.ema import WeightAverage, averaged
+    params = [nn.Parameter(torch.zeros(2)), nn.Parameter(torch.ones(1))]
+    avg = WeightAverage(params, 0.9)
+    assert avg.next_decay() == 0.1                        # warm start: the zero-effect init barely counts
+    with torch.no_grad():
+        params[0].fill_(1.0)
+    avg.update()
+    assert torch.allclose(avg.shadow[0], torch.full((2,), 0.9))
+    for _ in range(200):
+        avg.update()
+    assert avg.next_decay() == 0.9 and torch.allclose(avg.shadow[0], torch.ones(2))
+    with torch.no_grad():
+        params[0].fill_(3.0)
+    avg.update()                                          # 0.9 * 1 + 0.1 * 3
+    assert torch.allclose(avg.shadow[0], torch.full((2,), 1.2))
+    with averaged(avg):
+        assert torch.allclose(params[0], torch.full((2,), 1.2))   # evaluation, probes and saving see the average
+        state = avg.state()                                       # a checkpoint taken here still records the live weights
+        assert torch.allclose(state["live"][0], torch.full((2,), 3.0))
+    assert torch.allclose(params[0], torch.full((2,), 3.0))       # training continues on the live weights
+    other = WeightAverage([nn.Parameter(torch.zeros(2)), nn.Parameter(torch.zeros(1))], 0.9)
+    assert other.load(state) and other.updates == avg.updates
+    assert torch.allclose(other.shadow[0], avg.shadow[0]) and torch.allclose(other.params[0], params[0])
+    assert not other.load({"shadow": [torch.zeros(5)]})
+    with averaged(None):
+        pass
+
+
 def test_chunked_cross_entropy():
     torch.manual_seed(0)
     head = nn.Linear(16, 40, bias=False)

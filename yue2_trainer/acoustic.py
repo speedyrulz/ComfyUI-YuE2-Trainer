@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from .constants import FRAMES_PER_SECOND, LATENT_CHANNELS, MODEL_KEY_PREFIX, CONTEXT
 from .dataset import Dataset, Item
+from .ema import WeightAverage, averaged
 from .forward import nar_forward
 from .lora import adapter_weights_as, create_lora, select_target_modules, count_parameters
 from .monitor import TrainMonitor
@@ -58,6 +59,7 @@ class AcousticConfig:
     eval_samples: int = 8               # size of the fixed evaluation set
     eval_holdout: int = 1               # songs kept out of training and used for the evaluation set (0 = score training crops)
     keep: str = "final"                # final | best_eval: which weights the trainer returns
+    ema_decay: float = 0.0             # EMA of the LoRA weights, warm-started (0 = off); see ema.py
     tensorboard_dir: str = ""           # "" = off; parent folder for TensorBoard runs
     run_name: str = ""                  # TensorBoard run name (timestamp appended)
     existing_lora: Optional[dict] = None
@@ -81,6 +83,7 @@ class TrainResult:
     info: dict = field(default_factory=dict)
     evals: list = field(default_factory=list)   # [[step, fixed-noise loss], ...]
     state: Optional[dict] = None                # resumable optimizer / RNG / step state at the end of the run
+    raw_lora_sd: Optional[dict] = None          # with ema_decay: the last step's live weights (lora_sd is the average)
 
 
 def _shift_sigma(cfg: AcousticConfig, u: float) -> float:
@@ -387,6 +390,10 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
     optimizer = _make_optimizer(cfg.optimizer, primary.lora.trainable, cfg.learning_rate, cfg.weight_decay)
     logging.info("YuE2 trainer: %.2fM trainable LoRA parameters on %s", count_parameters(primary.lora.trainable) / 1e6,
                  ", ".join(str(d) for d in devices))
+    average = WeightAverage(primary.lora.trainable, cfg.ema_decay) if cfg.ema_decay > 0 else None
+    if average is not None:
+        logging.info("YuE2 trainer: averaging the LoRA weights (EMA, decay %.4g, warm-started); evaluation, samples, "
+                     "checkpoints and the result use the average", cfg.ema_decay)
 
     micro_steps = cfg.batch_size * cfg.grad_accumulation
     if micro_steps < len(devices):
@@ -404,6 +411,7 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
         start_step = int(restored["step"])
         losses, evals = list(restored["losses"]), [list(e) for e in restored["evals"]]
         samples_log = list(restored.get("samples", []))
+        _restore_average(average, restored, replicas)
         if start_step >= cfg.steps:
             raise ValueError(f"The resumed run is already at step {start_step}; set steps above it to continue "
                              "(or turn resume_state off to start a new run from the LoRA weights)")
@@ -417,7 +425,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             "caption_dropout": cfg.caption_dropout, "conditioning": cfg.conditioning,
             "devices": [str(d) for d in devices], "micro_steps": micro_steps,
             "semantic_conditioned_chunks": sum(1 for s in samples if s.prefix.ar_length == len(s.prefix.ids)),
-            "sample_every": cfg.sample_every if sample_cond is not None else 0, "samples": samples_log}
+            "sample_every": cfg.sample_every if sample_cond is not None else 0, "samples": samples_log,
+            "ema_decay": cfg.ema_decay}
 
     monitor = TrainMonitor("acoustic", cfg.steps, cfg.log_every, cfg.tensorboard_dir or None, cfg.run_name,
                            config={k: v for k, v in vars(cfg).items()
@@ -460,18 +469,34 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
         return total
 
     best: dict = {}
+    sample_failed: list = []
 
     def run_eval(index: int):
-        value = _evaluate(primary, eval_pool, eval_set, cfg)
-        evals.append([index, value])
-        monitor.eval(index, value)
-        if cfg.keep == "best_eval" and index > 0 and (not best or value < best["eval"]):
-            best.update(step=index, eval=value, lora_sd=primary.lora.export(), state=state_at(index))
+        with averaged(average):
+            value = _evaluate(primary, eval_pool, eval_set, cfg)
+            evals.append([index, value])
+            monitor.eval(index, value)
+            if cfg.keep == "best_eval" and index > 0 and (not best or value < best["eval"]):
+                best.update(step=index, eval=value, lora_sd=primary.lora.export(), state=state_at(index))
 
     def state_at(step: int) -> dict:
-        return capture_state("acoustic", cfg, step, optimizer, replicas, losses, evals, extra={"samples": samples_log})
+        return capture_state("acoustic", cfg, step, optimizer, replicas, losses, evals,
+                             extra={"samples": samples_log, **_average_state(average)})
 
     def run_sample(index: int):
+        if sample_failed:
+            return
+        try:
+            with averaged(average):
+                _run_sample(index)
+        except Exception as exc:  # noqa: BLE001 - rendering is auxiliary to the run
+            if type(exc).__name__ == "InterruptProcessingException":
+                raise
+            sample_failed.append(str(exc))
+            logging.warning("YuE2 trainer: rendering the sample failed (%s); no further samples this run", exc)
+            comfy.model_management.soft_empty_cache()
+
+    def _run_sample(index: int):
         started = time.perf_counter()
         frames = len(cfg.sample_codes)
         with adapter_weights_as(primary.lora, torch.bfloat16):
@@ -500,6 +525,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             grad_norm = float(torch.nn.utils.clip_grad_norm_(primary.lora.trainable, cfg.max_grad_norm or float("inf")))
             optimizer.step()
             sync_lora_weights(replicas)
+            if average is not None:
+                average.update()
             step_loss = loss_sum / micro_steps
             losses.append(step_loss)
             monitor.step(step + 1, step_loss, optimizer.param_groups[0]["lr"], grad_norm)
@@ -510,8 +537,9 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             if progress is not None:
                 progress(step + 1, cfg.steps, step_loss)
             if cfg.save_every and cfg.save_callback and (step + 1) % cfg.save_every == 0 and step + 1 < cfg.steps:
-                cfg.save_callback(primary.lora.export(), step + 1,
-                                  {**info, "steps": step + 1, "partial": True, "loss": step_loss}, state_at(step + 1))
+                with averaged(average):
+                    cfg.save_callback(primary.lora.export(), step + 1,
+                                      {**info, "steps": step + 1, "partial": True, "loss": step_loss}, state_at(step + 1))
         final_state = state_at(cfg.steps)
     finally:
         comfy.model_management.in_training = False
@@ -526,7 +554,11 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
             comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
 
-    exported = primary.lora.export()
+    raw = primary.lora.export() if average is not None else None
+    with averaged(average):
+        exported = primary.lora.export()
+    if average is not None:
+        info["ema_updates"] = average.updates
     for adapter in primary.lora.adapters:
         adapter.requires_grad_(False)
     info["tensorboard"] = str(monitor.log_dir) if monitor.log_dir else None
@@ -534,7 +566,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
         info["eval_loss_start"], info["eval_loss_final"] = evals[0][1], evals[-1][1]
     exported, final_state = _keep(cfg, best, exported, final_state, info, "acoustic")
     return TrainResult(lora_sd=exported, losses=losses, steps=cfg.steps,
-                       seconds=time.perf_counter() - start_time, info=info, evals=evals, state=final_state)
+                       seconds=time.perf_counter() - start_time, info=info, evals=evals, state=final_state,
+                       raw_lora_sd=raw)
 
 
 def _keep(cfg, best: dict, exported: dict, final_state, info: dict, kind: str):
@@ -552,6 +585,23 @@ def _keep(cfg, best: dict, exported: dict, final_state, info: dict, kind: str):
     logging.info("YuE2 %s: keeping the weights from step %d (evaluation loss %.4f) instead of the final step %d",
                  kind, best["step"], best["eval"], cfg.steps)
     return best["lora_sd"], best["state"]
+
+
+def _average_state(average) -> dict:
+    """The weight average's resume state, when there is one."""
+    return {"ema": average.state()} if average is not None else {}
+
+
+def _restore_average(average, restored: dict, replicas: list):
+    """Continue the weight average (and the live weights) from the resume state, or restart it."""
+    if average is None:
+        return
+    if average.load(restored.get("ema")):
+        sync_lora_weights(replicas)
+        logging.info("YuE2 trainer: weight average restored (%d updates)", average.updates)
+    else:
+        logging.warning("YuE2 trainer: the resume state has no matching weight average; averaging restarts from the "
+                        "checkpoint's weights")
 
 
 __all__ = ["AcousticConfig", "TrainResult", "train_acoustic_lora", "prepare_samples", "build_eval_set", "split_holdout"]
