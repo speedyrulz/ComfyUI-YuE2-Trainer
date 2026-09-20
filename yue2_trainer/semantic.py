@@ -19,7 +19,9 @@ module, ``Item.semantic`` and the ``.semantic.npy`` sidecars hold codebook indic
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
+import re
 import math
 import time
 from pathlib import Path
@@ -34,12 +36,36 @@ from .audio import load_audio, to_stereo_48k
 from .constants import CODEC_SIZE, FRAMES_PER_SECOND, SAMPLE_RATE
 from .dataset import Dataset, Item, cache_key
 
-HEAD_FILENAME = "tokenizer_head_joint_v4.pt"
+HEAD_FILENAME = "tokenizer_head_joint_v9.safetensors"   # the current head; every published head has the same architecture
 DEFAULT_MERT = "m-a-p/MERT-v2-FullSong"
 MERT_RATE = 24000
 MERT_LAYER = 20
 MERT_CHUNK = 30 * MERT_RATE
-SOURCE_TAG = "mothersuperior_v4"
+SOURCE_TAG = "mothersuperior_v4"      # tag of tokens written before heads were versioned (the v4 .pt head)
+
+
+def head_version(path) -> str:
+    """``tokenizer_head_joint_v9.bf16.safetensors`` -> ``v9``; ``tokenizer_head_v5_30k.safetensors`` -> ``v5_30k``."""
+    name = Path(path).name
+    for suffix in (".safetensors", ".pt"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    if name.endswith(".bf16"):
+        name = name[: -len(".bf16")]
+    match = re.search(r"_v(\d+(?:_[0-9a-z]+)?)$", name)
+    return f"v{match.group(1)}" if match else name
+
+
+def source_tag(head_path) -> str:
+    """The tag stored with the tokens (``mothersuperior_v9``), so a head change re-tokenizes instead of reusing."""
+    return f"mothersuperior_{head_version(head_path)}"
+
+
+def head_sort_key(name: str):
+    """Newest head first in a dropdown: v9 before v8 before v5_30k before v5 before v4 (.pt last)."""
+    version = head_version(name)
+    match = re.match(r"v(\d+)", version)
+    return (-(int(match.group(1)) if match else -1), version, name)
 
 
 class TokenHead(nn.Module):
@@ -224,8 +250,10 @@ class SemanticTokenizer:
         self.processor = AutoFeatureExtractor.from_pretrained(source, local_files_only=True)
         self.mert = load_mert(source, self.device)
         self.head = load_head(head_path, self.device)
-        logging.info("YuE2 trainer: loaded MERT (%s) and tokenizer head (%s) on %s in %.1fs", source, Path(head_path).name,
-                     self.device, time.perf_counter() - t0)
+        self.head_name = Path(head_path).name
+        self.source = source_tag(head_path)
+        logging.info("YuE2 trainer: loaded MERT (%s) and tokenizer head (%s, tokens tagged %s) on %s in %.1fs", source,
+                     self.head_name, self.source, self.device, time.perf_counter() - t0)
 
     def __enter__(self):
         return self
@@ -260,25 +288,33 @@ def tokenize_dataset(dataset: Dataset, tokenizer: SemanticTokenizer, force: bool
     """Fill ``item.semantic`` for every audio item (in place) and write ``<stem>.semantic.npy`` sidecars.
 
     Items from YuE2 output folders already carry the exact tokens and are left alone. Existing sidecars are
-    reused unless ``force``. Returns a summary dict.
+    reused unless ``force`` or they were written by another head (``<song>.semantic.json`` records the head; a
+    sidecar without one is taken as the v4 head's). Returns a summary dict.
     """
     done, reused, skipped, failed = [], [], [], []
     cache = Path(cache_dir) if cache_dir else None
+    tag = getattr(tokenizer, "source", SOURCE_TAG)
+    head_name = getattr(tokenizer, "head_name", "")
     todo = [item for item in dataset.items if item.audio_path]
     for index, item in enumerate(todo):
         if interrupt is not None:
             interrupt()
         if item.source == "yue2_output" and item.semantic:
             skipped.append(item.id)
-        elif item.semantic and not force and item.extra.get("semantic_source", SOURCE_TAG) == SOURCE_TAG:
+        elif item.semantic and not force and item.extra.get("semantic_source", SOURCE_TAG) == tag:
             reused.append(item.id)
         else:
             target = sidecar_path(item)
-            cached = cache / f"{cache_key(item, 'semantic|' + SOURCE_TAG)}.npy" if cache else None
+            cached = cache / f"{cache_key(item, 'semantic|' + tag)}.npy" if cache else None
             tokens = None
-            if not force:
+            if item.semantic and not force:
+                logging.info("YuE2 trainer: %s has tokens from %s; re-tokenizing with %s", item.id,
+                             item.extra.get("semantic_source", SOURCE_TAG), tag)
+            elif not force:
                 for candidate in (target, cached):
                     if candidate is not None and candidate.is_file():
+                        if candidate == target and _sidecar_source(target) != tag:
+                            continue
                         tokens = np.load(candidate, allow_pickle=False).astype(np.int64)
                         reused.append(item.id)
                         break
@@ -292,6 +328,7 @@ def tokenize_dataset(dataset: Dataset, tokenizer: SemanticTokenizer, force: bool
                     if write_sidecars and target is not None:
                         try:
                             np.save(target, tokens.astype(np.int32))
+                            _write_sidecar_source(target, tag, head_name)
                             wrote = target
                         except OSError as exc:
                             logging.warning("YuE2 trainer: cannot write %s (%s)", target, exc)
@@ -305,12 +342,30 @@ def tokenize_dataset(dataset: Dataset, tokenizer: SemanticTokenizer, force: bool
                     tokens = None
             if tokens is not None:
                 item.semantic = [int(t) for t in tokens]
-                item.extra["semantic_source"] = SOURCE_TAG
+                item.extra["semantic_source"] = tag
                 if item.frames is not None and abs(len(tokens) - item.frames) > 2 and len(tokens) < item.frames:
                     logging.warning("YuE2 trainer: %s has %d semantic tokens but %d latent frames", item.id, len(tokens), item.frames)
         if progress is not None:
             progress(index + 1, len(todo))
-    return {"tokenized": done, "reused": reused, "skipped_true_tokens": skipped, "failed": failed, "source": SOURCE_TAG}
+    return {"tokenized": done, "reused": reused, "skipped_true_tokens": skipped, "failed": failed, "source": tag}
+
+
+def sidecar_meta_path(npy_path) -> Path:
+    """``song.semantic.npy`` -> ``song.semantic.json`` (which head wrote the tokens)."""
+    npy_path = Path(npy_path)
+    return npy_path.with_name(npy_path.name[: -len(".npy")] + ".json")
+
+
+def _sidecar_source(npy_path) -> str:
+    try:
+        meta = json.loads(sidecar_meta_path(npy_path).read_text(encoding="utf-8"))
+        return str(meta.get("source") or SOURCE_TAG)
+    except (OSError, ValueError):
+        return SOURCE_TAG
+
+
+def _write_sidecar_source(npy_path, tag: str, head_name: str):
+    sidecar_meta_path(npy_path).write_text(json.dumps({"source": tag, "head": head_name}, indent=1), encoding="utf-8")
 
 
 def summarize(summary: dict) -> str:
@@ -320,4 +375,5 @@ def summarize(summary: dict) -> str:
 
 
 __all__ = ["TokenHead", "load_head", "load_mert", "normalize", "windows", "predict", "mert_features", "chunk_plan", "SemanticTokenizer",
-           "tokenize_dataset", "summarize", "sidecar_path", "HEAD_FILENAME", "DEFAULT_MERT", "SOURCE_TAG"]
+           "tokenize_dataset", "summarize", "sidecar_path", "sidecar_meta_path", "head_version", "source_tag",
+           "head_sort_key", "HEAD_FILENAME", "DEFAULT_MERT", "SOURCE_TAG"]

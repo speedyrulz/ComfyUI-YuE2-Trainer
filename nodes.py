@@ -32,7 +32,7 @@ from .yue2_trainer.planner import (MUSIC_SAMPLING, PROBE_SAMPLING, PlannerConfig
 from .yue2_trainer.prefix import resolve_mode
 from .yue2_trainer.render import Renderer, pick_render_device, sample_stream, save_wav, tokens_and_prompt
 from .yue2_trainer.resume import load_state, save_state, state_path
-from .yue2_trainer.semantic import DEFAULT_MERT, HEAD_FILENAME, SemanticTokenizer, tokenize_dataset
+from .yue2_trainer.semantic import DEFAULT_MERT, HEAD_FILENAME, SemanticTokenizer, head_sort_key, tokenize_dataset
 from .yue2_trainer.semantic import summarize as summarize_semantic
 from .yue2_trainer.parallel import resolve_devices
 
@@ -366,8 +366,8 @@ class YuE2TrainerEncodeDataset(io.ComfyNode):
 
 
 def _head_choices():
-    names = folder_paths.get_filename_list("audio_encoders")
-    return sorted(names, key=lambda n: (HEAD_FILENAME not in n, n)) or [HEAD_FILENAME]
+    names = [n for n in folder_paths.get_filename_list("audio_encoders") if "tokenizer_head" in n]
+    return sorted(names, key=head_sort_key) or [HEAD_FILENAME]
 
 
 class YuE2TrainerSemanticTokens(io.ComfyNode):
@@ -377,7 +377,7 @@ class YuE2TrainerSemanticTokens(io.ComfyNode):
             node_id="YuE2TrainerSemanticTokens",
             display_name="YuE2 Semantic Tokens (community head)",
             category=CATEGORY,
-            description="Predicts YuE2 semantic tokens for every recording with the Mothersuperior v4 tokenizer head "
+            description="Predicts YuE2 semantic tokens for every recording with a Mothersuperior tokenizer head (v9 current) "
                         "(MERT-v2-FullSong layer 20 -> 32,768 codes, 25 per second) and writes <song>.semantic.npy next to "
                         "the audio. An approximation of YuE2's unreleased tokenizer: a round trip keeps a song's rhythm and "
                         "most of its harmony. Enables train_semantic on the planner node and use_semantic_tokens on the "
@@ -385,13 +385,16 @@ class YuE2TrainerSemanticTokens(io.ComfyNode):
             inputs=[
                 DATASET.Input("dataset"),
                 io.Combo.Input("head", options=_head_choices(),
-                               tooltip=f"{HEAD_FILENAME} from huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4, "
-                                       "placed in models/audio_encoders (CC BY-NC 4.0)."),
+                               tooltip=f"A tokenizer_head_*.safetensors from huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-"
+                                       f"tokenizer-v4 placed in models/audio_encoders (CC BY-NC 4.0); {HEAD_FILENAME} is the current "
+                                       "one (trained with an audio-domain loss; pair it with nar_lora_joint_v9_comfyui on the MODEL "
+                                       "path when rendering its tokens). Tokens record the head that wrote them "
+                                       "(<song>.semantic.json); a head change re-tokenizes."),
                 io.String.Input("mert", default=DEFAULT_MERT,
                                 tooltip="MERT-v2-FullSong: a local folder with the model files, or the Hugging Face id "
                                         "(downloaded to the HF cache on first use, about 630 MB)."),
                 io.Combo.Input("device", options=[d for d in device_choices() if d != "all"], default="auto"),
-                io.Boolean.Input("force", default=False, tooltip="Recompute even when a .semantic.npy sidecar exists."),
+                io.Boolean.Input("force", default=False, tooltip="Recompute even when a .semantic.npy sidecar from this head exists."),
                 io.Boolean.Input("write_sidecars", default=True,
                                  tooltip="Write <song>.semantic.npy next to the audio (reused by later runs and by the "
                                          "Dataset From Folder node). Off: cache under output/yue2_trainer_cache/semantic."),

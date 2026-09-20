@@ -288,6 +288,27 @@ def test_weight_average_warm_start_apply_and_resume():
         pass
 
 
+def test_tokenizer_head_versions(tmp_path):
+    import yue2_trainer.semantic as S
+    assert S.head_version("tokenizer_head_joint_v9.safetensors") == "v9"
+    assert S.head_version("tokenizer_head_joint_v9.bf16.safetensors") == "v9"
+    assert S.head_version("tokenizer_head_joint_v4.pt") == "v4"
+    assert S.head_version("tokenizer_head_v5_30k.safetensors") == "v5_30k"
+    assert S.source_tag("x/tokenizer_head_joint_v8.safetensors") == "mothersuperior_v8"
+    names = ["tokenizer_head_joint_v4.pt", "tokenizer_head_joint_v9.safetensors", "tokenizer_head_v5_30k.safetensors",
+             "tokenizer_head_joint_v8.bf16.safetensors"]
+    assert [S.head_version(n) for n in sorted(names, key=S.head_sort_key)] == ["v9", "v8", "v5_30k", "v4"]
+    npy = tmp_path / "song.semantic.npy"
+    np.save(npy, np.arange(5))
+    assert S._sidecar_source(npy) == S.SOURCE_TAG            # untagged sidecar = the v4 head's
+    S._write_sidecar_source(npy, "mothersuperior_v9", "tokenizer_head_joint_v9.safetensors")
+    assert S._sidecar_source(npy) == "mothersuperior_v9" and S.sidecar_meta_path(npy).name == "song.semantic.json"
+    from yue2_trainer.dataset import scan_folder
+    (tmp_path / "song.flac").write_bytes(b"")
+    item = scan_folder(str(tmp_path)).items[0]
+    assert item.extra.get("semantic_source") == "mothersuperior_v9" and item.semantic == [0, 1, 2, 3, 4]
+
+
 def test_chunked_cross_entropy():
     torch.manual_seed(0)
     head = nn.Linear(16, 40, bias=False)

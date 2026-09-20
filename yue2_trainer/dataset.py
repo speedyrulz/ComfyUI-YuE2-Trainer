@@ -139,6 +139,12 @@ def _item_from_audio(audio: Path, default_style: str, default_lyrics: str) -> It
     sem_path = Path(str(stem) + ".semantic.npy")
     if sem_path.is_file():
         semantic = _semantic_from(str(sem_path), audio.parent)
+        meta = _read_text(Path(str(stem) + ".semantic.json"))
+        if meta:
+            try:
+                extra["semantic_source"] = str(json.loads(meta).get("source") or "")
+            except ValueError:
+                pass
     return Item(id=audio.stem, audio_path=str(audio), style=style, lyrics=lyrics, abc=abc,
                 semantic=semantic, extra=extra)
 

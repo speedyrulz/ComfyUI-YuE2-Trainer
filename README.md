@@ -61,16 +61,22 @@ tokenizer is not public (see *Limitations*).
 YuE2's AR stage writes *semantic tokens* (32,768 codes, 25 per second) that fix the composition, and the
 acoustic stage renders them. The encoder that turns audio into those tokens has not been released, so
 training the planner or the acoustic model on real songs normally has no semantic tokens to work with.
-[Mothersuperior's realaudio tokenizer v4](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
+[Mothersuperior's realaudio tokenizer](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 is a community stand-in: an 8-layer transformer head on MERT-v2-FullSong layer-20 features, fitted on
-YuE2's own generations. **YuE2 Semantic Tokens (community head)** runs it over a dataset and writes the
-`.semantic.npy` sidecars, so afterwards `train_semantic` on the planner node and `use_semantic_tokens` on
-the acoustic node work on your own recordings. Files to download yourself (both CC BY-NC 4.0):
-`tokenizer_head_joint_v4.pt` into `models/audio_encoders`, and
+YuE2's own generations and, from v5 on, real recordings. Every published head (v4, v5, v5_30k, v8, v9) has
+the same architecture and input, so the node lists whichever `tokenizer_head_*.safetensors` / `.pt` files
+are in `models/audio_encoders`, newest first; `tokenizer_head_joint_v9.safetensors` is the current one
+(co-trained with an audio-domain loss against real recordings, 2026-09-16). **YuE2 Semantic Tokens
+(community head)** runs the chosen head over a dataset and writes the `.semantic.npy` sidecars (plus a
+`.semantic.json` naming the head, so a later run with another head re-tokenizes instead of reusing), and
+afterwards `train_semantic` on the planner node and `use_semantic_tokens` on the acoustic node work on your
+own recordings. Files to download yourself (all CC BY-NC 4.0): a head into `models/audio_encoders`, and
 [m-a-p/MERT-v2-FullSong](https://huggingface.co/m-a-p/MERT-v2-FullSong) (a local folder for the `mert`
-input, or leave the Hugging Face id and it is fetched into the HF cache on first use, about 630 MB). The
-head's NAR companion LoRA is not needed and not used: in our test it made renders less similar to the
-original. Note for anyone running the head elsewhere: with transformers 5, `AutoModel.from_pretrained`
+input, or leave the Hugging Face id and it is fetched into the HF cache on first use, about 630 MB). Each
+head ships with a matching decoder LoRA (`nar_lora_joint_vN_comfyui.safetensors`, loaded on the MODEL
+path); the v4 one made renders less similar to the original in our test, the v8/v9 ones were trained
+against the audio of real recordings and are meant to be used with their head. Note for anyone running
+the head elsewhere: with transformers 5, `AutoModel.from_pretrained`
 leaves MERT-v2's rotary `inv_freq` buffer uninitialised (features silently wrong or NaN, differently on
 every load); the node builds the model from its config and loads the weights into it, which is what the
 numbers below used.
@@ -121,7 +127,7 @@ C:/ai/ComfyUI/venv/Scripts/python.exe prepare_dataset.py D:/songs --sections cla
 | **YuE2 Prepare Dataset** | Generate missing `.style.txt` / `.lyrics.txt` sidecars (LRCLIB + Whisper, CLAP tags) and output the scanned dataset. |
 | **YuE2 Dataset From Audio** | One-item dataset from a `LoadAudio` output plus style / lyrics / ABC (chain with `append_to`). |
 | **YuE2 Merge Datasets** | Concatenate two datasets. |
-| **YuE2 Semantic Tokens (community head)** | Predict YuE2 semantic tokens for every recording with the Mothersuperior v4 head (MERT-v2-FullSong + small transformer) and write `<song>.semantic.npy`. Enables `train_semantic` / `use_semantic_tokens` on real songs. |
+| **YuE2 Semantic Tokens (community head)** | Predict YuE2 semantic tokens for every recording with a Mothersuperior tokenizer head (v9 current; MERT-v2-FullSong + small transformer) and write `<song>.semantic.npy` (+ `.semantic.json` naming the head). Enables `train_semantic` / `use_semantic_tokens` on real songs. |
 | **YuE2 Encode Dataset** | VAE-encode every item to latents in fp32 (cached under `output/yue2_trainer_cache`), optionally transcribe missing ABC with a SheetSage2 `AUDIO_ENCODER`. |
 | **YuE2 Train Acoustic LoRA (MODEL)** | Flow-matching LoRA training of the acoustic model. Outputs `LORA_MODEL`, `LOSS_MAP`, steps, a text report. |
 | **YuE2 Train Planner LoRA (CLIP)** | Next-token LoRA training of the language model on ABC (and semantic tokens when present). Optional regularization input, checkpoint probes and rendered song clips (see below). |

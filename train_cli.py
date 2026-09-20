@@ -157,8 +157,9 @@ def add_common(p):
     p.add_argument("--force-reencode", action="store_true")
     p.add_argument("--transcribe", choices=["none", "melody", "full"], default="none")
     p.add_argument("--semantic-head", default=None, metavar="FILE",
-                   help="Predict semantic tokens for every song with the Mothersuperior v4 head (name in "
-                        "models/audio_encoders or a path); writes <song>.semantic.npy sidecars.")
+                   help="Predict semantic tokens for every song with a Mothersuperior tokenizer head, e.g. "
+                        "tokenizer_head_joint_v9.safetensors (name in models/audio_encoders or a path); writes "
+                        "<song>.semantic.npy (+ .semantic.json naming the head) sidecars.")
     p.add_argument("--mert", default="m-a-p/MERT-v2-FullSong", help="MERT-v2-FullSong folder or Hugging Face id.")
     p.add_argument("--semantic-force", action="store_true", help="Recompute semantic tokens even when sidecars exist.")
     p.add_argument("--sheetsage", default="sheetsage2_bf16.safetensors")
