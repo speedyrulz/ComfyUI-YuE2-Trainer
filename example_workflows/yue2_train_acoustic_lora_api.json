@@ -153,7 +153,7 @@
     "3",
     0
    ],
-   "head": "tokenizer_head_joint_v4.pt",
+   "head": "tokenizer_head_joint_v9.safetensors",
    "mert": "m-a-p/MERT-v2-FullSong",
    "device": "auto",
    "force": false,
