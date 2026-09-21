@@ -212,6 +212,18 @@ class Renderer:
             LOG.info("YuE2 trainer: acoustic model loaded on %s for rendering probes", self.device)
         return self.patcher
 
+    def unload(self):
+        """Drop the acoustic model from ComfyUI's loader again (it is reloaded on the next render)."""
+        import comfy.model_management
+        if self.patcher is None:
+            return
+        for loaded in list(comfy.model_management.current_loaded_models):
+            if loaded.model is self.patcher:
+                loaded.model_unload()
+                comfy.model_management.current_loaded_models.remove(loaded)
+        self.patcher = None
+        comfy.model_management.soft_empty_cache()
+
     def render(self, conditioning: list, frames: int, seed: int) -> tuple[np.ndarray, int]:
         latents = sample_latents(self.load(), conditioning, frames, seed, self.steps, self.cfg, self.sampler, self.scheduler)
         return decode_audio(self.vae, latents, self.device)

@@ -80,8 +80,9 @@ def encode_dataset(dataset, vae, args, audio_encoder=None):
                 wave, sr = load_audio(item.audio_path)
                 waveform = crop_audio(to_stereo_48k(wave, sr), args.max_seconds)
                 t0 = time.perf_counter()
-                item.latents = encode_latents(vae, waveform, window_seconds=args.window_seconds,
-                                              precision=args.vae_precision).to(torch.float16)
+                with torch.inference_mode():   # as the Encode Dataset node runs
+                    item.latents = encode_latents(vae, waveform, window_seconds=args.window_seconds,
+                                                  precision=args.vae_precision).to(torch.float16)
                 logging.info("encoded %s: %d frames in %.1fs", item.id, item.latents.shape[-1], time.perf_counter() - t0)
                 cached = {"latents": item.latents, **({k: v for k, v in (cached or {}).items() if k != "latents"})}
                 save_cache(cache, key, cached)

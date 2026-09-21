@@ -262,6 +262,42 @@ def _lora_off(lora):
 _adapter_weights_as = adapter_weights_as   # ComfyUI's sampler feeds the bypass hooks bf16 activations
 
 
+def _release_prefetch():
+    """What ComfyUI's executor does between nodes: drop the dynamic loader's prefetch queues and CUDA malloc
+    graphs. A training node runs thousands of forwards inside one node, so they would otherwise pile up."""
+    try:
+        import comfy.model_prefetch
+        comfy.model_prefetch.cleanup_prefetch_queues()
+    except Exception as exc:  # noqa: BLE001 - older ComfyUI without the module
+        logging.debug("YuE2 trainer: no prefetch queues to release (%s)", exc)
+
+
+def restage(patcher):
+    """Make a model loaded by ComfyUI's dynamic VRAM loader fast again for generation after a training step.
+
+    During a training step the loader clamps how much of the model may stay resident on the GPU (a watermark
+    limit on the model's address space, set from the free memory at that moment) and never raises it again.
+    Token-by-token generation with a long context then no longer fits under the clamp, and the loader copies
+    the trimmed weights from pinned RAM for every generated token: 96% of the GPU time in host-to-device
+    copies, probes 8-20x slower (7 tokens/s instead of 60). Resetting the limits and prioritising the model,
+    as a fresh load does, restores full speed. Harmless for models that are not dynamically loaded."""
+    import comfy.model_management
+    _release_prefetch()
+    comfy.model_management.soft_empty_cache()
+    vbar = getattr(patcher, "_vbar_get", lambda: None)()
+    if vbar is None:
+        if not getattr(patcher, "is_dynamic", lambda: False)():
+            comfy.model_management.load_models_gpu([patcher], force_full_load=True)
+        return
+    try:
+        import comfy_aimdo.control
+        comfy_aimdo.control.lib.vbars_reset_watermark_limits(vbar._devctx)
+        vbar.set_watermark_limit(vbar.max_size)
+        vbar.prioritize()
+    except Exception as exc:  # noqa: BLE001 - a comfy-aimdo without these calls
+        logging.debug("YuE2 trainer: vbar watermark reset not available (%s)", exc)
+
+
 def _load_clips(clip, devices: list[torch.device]):
     """One CLIP (with its own text-encoder copy for replicas beyond the first) per device, loaded via ComfyUI."""
     import comfy.model_management
@@ -444,8 +480,14 @@ def train_planner_lora(clip, dataset: Dataset, cfg: PlannerConfig,
 
     def run_probe(index: int, with_music: bool):
         """A probe score; with ``with_music`` also the sample: music tokens for it, rendered through render_callback."""
+        # Free the training step's cached VRAM first: with ComfyUI's dynamic VRAM loader, memory the caching
+        # allocator holds looks occupied, and the loader then streams the language model's weights from RAM for
+        # every generated token (8x slower probes).
+        comfy.model_management.soft_empty_cache()
+        restage(primary.extra["clip"].patcher)
         with averaged(average):
             _run_probe(index, with_music)
+        _release_prefetch()
 
     def _run_probe(index: int, with_music: bool):
         started = time.perf_counter()

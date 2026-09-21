@@ -487,6 +487,8 @@ def train_acoustic_lora(model_patcher, clip, dataset: Dataset, cfg: AcousticConf
         if sample_failed:
             return
         try:
+            from .planner import restage
+            restage(primary.extra["patcher"])   # see planner.restage: the dynamic loader clamps residency after a step
             with averaged(average):
                 _run_sample(index)
         except Exception as exc:  # noqa: BLE001 - rendering is auxiliary to the run
