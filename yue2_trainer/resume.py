@@ -63,7 +63,7 @@ def restore_state(state: dict, kind: str, cfg, optimizer, replicas) -> Optional[
                         ", ".join(f"{k}={a!r} (now {b!r})" for k, (a, b) in mismatch.items()))
         return None
     try:
-        optimizer.load_state_dict(state["optimizer"])
+        optimizer.load_state_dict(_clone(state["optimizer"]))   # the file was read under ComfyUI's inference mode
     except (ValueError, KeyError, RuntimeError) as exc:
         logging.warning("YuE2 trainer: optimizer state does not match the LoRA (%s); starting fresh", exc)
         return None
@@ -79,6 +79,17 @@ def _rng_tuple(value):
     """random.Random.getstate() is (version, tuple_of_ints, gauss_next); torch.save round-trips tuples as lists."""
     if isinstance(value, (list, tuple)) and len(value) == 3:
         return (value[0], tuple(int(v) for v in value[1]), value[2])
+    return value
+
+
+def _clone(value):
+    """Ordinary copies of every tensor (inference tensors cannot be updated in place by the optimizer)."""
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {k: _clone(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_clone(v) for v in value)
     return value
 
 

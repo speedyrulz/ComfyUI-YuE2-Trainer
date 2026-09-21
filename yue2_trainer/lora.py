@@ -91,7 +91,8 @@ def create_lora(root: nn.Module, targets: list[tuple[str, nn.Module]], rank: int
     from comfy.weight_adapter.bypass import BypassInjectionManager
     from comfy.weight_adapter.lora import LoRAAdapter
 
-    existing = existing or {}
+    # ComfyUI loads LoRA files under inference mode; the optimizer must update ordinary tensors, so copy them here
+    existing = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in (existing or {}).items()}
     manager = BypassInjectionManager()
     lora_sd, trainable, adapters = {}, [], []
     resumed = 0
