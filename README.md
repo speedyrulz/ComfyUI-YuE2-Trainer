@@ -163,11 +163,11 @@ or use *Load*; recent frontends import API-format JSON):
 - `yue2_generate_with_lora_api.json` – the stock YuE2 generation graph with two **YuE2 Load LoRA** nodes between
   the checkpoint loader and the YuE2 nodes: the acoustic LoRA on the MODEL path, the planner LoRA on the CLIP path
 - `yue2_render_tokens_api.json` – renders a probe's music tokens: checkpoint → **YuE2 Load LoRA** (the checkpoint
-  the probe came from, CLIP path) → **YuE2 Conditioning From Tokens** → KSampler(32 steps, cfg 1) → VAEDecodeAudio
+  the probe came from, CLIP path) → **YuE2 Conditioning From Tokens** → KSampler(6 steps, dpmpp_2m, cfg 1) → VAEDecodeAudio
 
 Generation with LoRAs is the standard graph: `CheckpointLoaderSimple → YuE2 Load LoRA (acoustic, model only) /
 YuE2 Load LoRA (planner, clip only) → YuE2GenerateABC / YuE2GenerateMusic → ModelSamplingAuraFlow(shift 3) →
-KSampler(32 steps, cfg 1, euler, simple) → VAEDecodeAudio`. Each Load LoRA node takes only the input its file
+KSampler(6 steps, cfg 1, dpmpp_2m, simple) → VAEDecodeAudio`. Each Load LoRA node takes only the input its file
 patches, so the two stack without touching each other; one node with both inputs connected works for a single LoRA.
 The stock template uses 64 steps and cfg 2; in a same-seed comparison the step count, solver and shift changed the
 render by less than 0.1% while cfg 2 (guidance against a zeroed conditioning the model never saw in training)

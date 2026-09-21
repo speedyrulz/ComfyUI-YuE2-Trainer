@@ -90,9 +90,9 @@
     0
    ],
    "seed": 831001,
-   "steps": 32,
+   "steps": 6,
    "cfg": 1.0,
-   "sampler_name": "euler",
+   "sampler_name": "dpmpp_2m",
    "scheduler": "simple",
    "denoise": 1.0
   }

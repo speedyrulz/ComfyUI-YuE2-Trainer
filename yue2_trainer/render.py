@@ -126,8 +126,8 @@ def pick_render_device(spec: str, training: list) -> Optional[torch.device]:
     return torch.device(spec)
 
 
-def sample_latents(patcher, conditioning: list, frames: int, seed: int, steps: int = 32, cfg: float = 1.0,
-                   sampler: str = "euler", scheduler: str = "simple") -> torch.Tensor:
+def sample_latents(patcher, conditioning: list, frames: int, seed: int, steps: int = 6, cfg: float = 1.0,
+                   sampler: str = "dpmpp_2m", scheduler: str = "simple") -> torch.Tensor:
     """Run ComfyUI's acoustic stage (the KSampler path) on ``patcher`` for ``frames`` latent frames."""
     import comfy.sample
     cond, extra = conditioning[0]
@@ -196,7 +196,7 @@ class Renderer:
     The MODEL patcher is cloned for ``device`` and loaded through ComfyUI on first use; the VAE is moved over
     for each decode and put back afterwards."""
 
-    def __init__(self, model_patcher, vae, device, steps: int = 32, cfg: float = 1.0, sampler: str = "euler",
+    def __init__(self, model_patcher, vae, device, steps: int = 6, cfg: float = 1.0, sampler: str = "dpmpp_2m",
                  scheduler: str = "simple"):
         self.model_patcher = model_patcher
         self.vae = vae
